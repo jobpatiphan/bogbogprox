@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/snare-core",
+    "crates/snare-store-sqlite",
+    "crates/snare-engine",
+    "crates/snared",
+    "crates/snare-tui",
+    "crates/snare-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Snare contributors"]
+repository = "https://github.com/jobpatiphan/snareproxy"
+rust-version = "1.75"
+
+[workspace.dependencies]
+snare-core = { path = "crates/snare-core" }
+snare-store-sqlite = { path = "crates/snare-store-sqlite" }
+snare-engine = { path = "crates/snare-engine" }
+
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,24 @@
+[package]
+name = "snared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "snared"
+path = "src/main.rs"
+
+[dependencies]
+snare-core.workspace = true
+snare-engine.workspace = true
+snare-store-sqlite.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.7"

@@ -63,8 +63,28 @@ See the full **57-section architecture** in **[`docs/DESIGN.md`](docs/DESIGN.md)
 
 ## Status
 
-🚧 **Design / Planning** — the architecture is complete; app code has not started yet.
-The design document ([`docs/DESIGN.md`](docs/DESIGN.md)) covers vision, engine, concurrency, storage, MCP, scanner, AI agent, security threat model, 20 ADRs, roadmap, and moonshots.
+🟢 **Phase 1 core loop working** — a real, runnable vertical slice: the proxy
+intercepts and decrypts HTTPS, captures every request/response into SQLite, and
+exposes them over a REST API, an MCP server (so Claude can query flows), and a
+TUI. The full [`docs/DESIGN.md`](docs/DESIGN.md) (57 sections) covers the rest of
+the road: scanner, AI agent, threat model, 20 ADRs, and moonshots.
+
+### Quickstart
+
+```bash
+cargo build
+./target/debug/snared ca generate          # unique per-install CA (§28)
+# install the printed cert in your browser/OS trust store, then:
+./target/debug/snared run                   # proxy :8080, REST API :9000
+# point your browser/curl at the proxy:
+curl --proxy http://127.0.0.1:8080 --cacert <ca.pem> https://example.com
+./target/debug/snared flows                 # list captured flows (CLI)
+./target/debug/snare-tui                     # or watch them live in the TUI
+```
+
+The `snare-mcp` binary is a stdio MCP server exposing `proxy_list_flows`,
+`proxy_get_flow`, and `proxy_stats` — point an MCP client (e.g. Claude) at it to
+drive the captured traffic.
 
 ### Roadmap
 

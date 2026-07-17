@@ -1,0 +1,17 @@
+[package]
+name = "snare-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "snare-mcp"
+path = "src/main.rs"
+
+[dependencies]
+snare-core.workspace = true
+snare-store-sqlite.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+directories.workspace = true
