@@ -3,7 +3,7 @@ name = "snare-desktop"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/jobpatiphan/snareproxy"
+repository = "https://github.com/jobpatiphan/bogbogprox"
 description = "Snare desktop — native Tauri shell over the daemon's dashboard (§5.3)"
 
 [[bin]]

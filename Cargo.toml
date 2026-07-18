@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Snare contributors"]
-repository = "https://github.com/jobpatiphan/snareproxy"
+repository = "https://github.com/jobpatiphan/bogbogprox"
 rust-version = "1.75"
 
 [workspace.dependencies]
