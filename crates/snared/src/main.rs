@@ -31,8 +31,8 @@ enum Cmd {
     },
     /// Run the proxy + REST API.
     Run {
-        /// Proxy listen address.
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        /// Proxy listen address. (8888 by default — 8080 is a common clash.)
+        #[arg(long, default_value = "127.0.0.1:8888")]
         proxy: SocketAddr,
         /// REST API listen address.
         #[arg(long, default_value = "127.0.0.1:9000")]

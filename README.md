@@ -75,16 +75,33 @@ the road: scanner, AI agent, threat model, 20 ADRs, and moonshots.
 cargo build
 ./target/debug/snared ca generate          # unique per-install CA (§28)
 # install the printed cert in your browser/OS trust store, then:
-./target/debug/snared run                   # proxy :8080, REST API :9000
+./target/debug/snared run                   # proxy :8888, REST API + dashboard :9000
+# open the live dashboard in any browser:
+#   http://127.0.0.1:9000/
 # point your browser/curl at the proxy:
-curl --proxy http://127.0.0.1:8080 --cacert <ca.pem> https://example.com
+curl --proxy http://127.0.0.1:8888 --cacert <ca.pem> https://example.com
 ./target/debug/snared flows                 # list captured flows (CLI)
-./target/debug/snare-tui                     # or watch them live in the TUI
+./target/debug/snare-tui                     # or watch them live in the TUI (r = resend)
 ```
 
+Ports are overridable: `snared run --proxy 127.0.0.1:9999 --api 127.0.0.1:9001`.
+
+Three faces, one core — the same live dashboard, natively:
+
+```bash
+./target/debug/snare-desktop     # native window (Tauri) onto the daemon dashboard
+# SNARE_URL=http://remote:9000/ ./target/debug/snare-desktop   # or a remote daemon
+```
+
+> **Desktop build prerequisites (Linux):** the `snare-desktop` crate needs the
+> Tauri/webkit system libraries:
+> `sudo apt install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev pkg-config`.
+> The other crates build without them.
+
 The `snare-mcp` binary is a stdio MCP server exposing `proxy_list_flows`,
-`proxy_get_flow`, and `proxy_stats` — point an MCP client (e.g. Claude) at it to
-drive the captured traffic.
+`proxy_get_flow`, `proxy_stats`, and `repeater_send` — point an MCP client (e.g.
+Claude) at it to drive the captured traffic. It reports each call to the daemon,
+so the dashboard shows, live, what the agent is doing.
 
 ### Roadmap
 
