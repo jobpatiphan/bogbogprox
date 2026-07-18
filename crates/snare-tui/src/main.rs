@@ -47,6 +47,10 @@ struct App {
     status: String,
     /// Last AI activity + when it arrived (shown briefly in the header).
     activity: Option<(String, Instant)>,
+    /// Request-intercept on/off (mirrored from the daemon).
+    intercept_on: bool,
+    /// Held items awaiting a decision: (id, is_response, label).
+    held: std::collections::VecDeque<(u64, bool, String)>,
     events: Receiver<FlowEvent>,
     last_refresh: Instant,
 }
@@ -64,6 +68,8 @@ impl App {
             detail_for: None,
             status: "connecting…".into(),
             activity: None,
+            intercept_on: false,
+            held: std::collections::VecDeque::new(),
             events,
             last_refresh: Instant::now() - Duration::from_secs(10),
         }
@@ -113,13 +119,20 @@ impl App {
                 }
                 // Intercept is driven from the Web UI for now; surface a hint in
                 // the TUI status line but don't handle it here.
-                FlowEvent::InterceptPaused { .. } | FlowEvent::InterceptRespPaused { .. } => {
-                    self.activity = Some(("⏸ held (use Web UI)".into(), Instant::now()));
+                FlowEvent::InterceptPaused { id, request } => {
+                    let label = format!("{} {}{}", request.method, request.host, request.path);
+                    self.held.push_back((id, false, label));
                 }
+                FlowEvent::InterceptRespPaused { id, response } => {
+                    self.held.push_back((id, true, format!("response {}", response.status)));
+                }
+                FlowEvent::InterceptResolved { id, .. } => {
+                    self.held.retain(|(hid, _, _)| *hid != id);
+                }
+                FlowEvent::InterceptState { on, .. } => self.intercept_on = on,
                 FlowEvent::Finding { finding } => {
                     self.activity = Some((format!("⚠ {}", finding.title), Instant::now()));
                 }
-                FlowEvent::InterceptResolved { .. } | FlowEvent::InterceptState { .. } => {}
             }
         }
         self.status = format!("{} flows", self.flows.len());
@@ -205,6 +218,30 @@ impl App {
     }
 }
 
+impl App {
+    /// Toggle request intercept (state syncs back via the SSE event).
+    fn toggle_intercept(&mut self) {
+        let body = format!("{{\"on\":{}}}", !self.intercept_on);
+        let _ = httpclient::post_body(&self.host, self.port, "/api/v1/intercept", &body);
+    }
+
+    /// Forward (as-is) or drop the oldest held item. Editing is Web-only.
+    fn resolve_held(&mut self, drop: bool) {
+        let Some((id, is_resp, _)) = self.held.front().cloned() else {
+            return;
+        };
+        let path = match (is_resp, drop) {
+            (false, false) => format!("/api/v1/intercept/{id}/forward"),
+            (false, true) => format!("/api/v1/intercept/{id}/drop"),
+            (true, false) => format!("/api/v1/intercept/{id}/forward-response"),
+            (true, true) => format!("/api/v1/intercept/{id}/drop-response"),
+        };
+        if httpclient::post(&self.host, self.port, &path).is_ok() {
+            self.held.retain(|(hid, _, _)| *hid != id);
+        }
+    }
+}
+
 fn summary_from(flow: &Flow) -> FlowSummary {
     FlowSummary {
         id: flow.id,
@@ -266,6 +303,9 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) 
                     }
                     KeyCode::Char('r') => app.resend(),
                     KeyCode::Char('R') => app.refresh(),
+                    KeyCode::Char('i') => app.toggle_intercept(),
+                    KeyCode::Char('f') => app.resolve_held(false),
+                    KeyCode::Char('d') => app.resolve_held(true),
                     _ => {}
                 }
             }
@@ -284,8 +324,28 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Span::raw("  "),
         Span::styled(app.status.clone(), Style::default().fg(Color::Cyan)),
     ];
-    // Show the latest AI activity for a few seconds after it lands.
-    if let Some((label, at)) = &app.activity {
+    if app.intercept_on {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            " ⏸ INTERCEPT ",
+            Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    // A held request/response takes priority in the header.
+    if let Some((id, _, label)) = app.held.front() {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            format!("HELD #{id} {label} — f=forward d=drop"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        if app.held.len() > 1 {
+            title_spans.push(Span::styled(
+                format!("  (+{} more)", app.held.len() - 1),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else if let Some((label, at)) = &app.activity {
+        // Otherwise show the latest AI activity for a few seconds.
         if at.elapsed() < Duration::from_secs(8) {
             title_spans.push(Span::raw("   "));
             title_spans.push(Span::styled(
@@ -333,7 +393,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(detail_widget(app), body[1]);
 
     let help = Line::from(Span::styled(
-        " j/k move · g/G top/bottom · r resend · R reload · q quit ",
+        " j/k move · g/G top/bottom · r resend · i intercept · f/d forward/drop · R reload · q quit ",
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(help), chunks[2]);

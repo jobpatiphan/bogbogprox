@@ -9,13 +9,25 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 fn request(method: &str, host: &str, port: u16, path: &str, read_secs: u64) -> Result<Vec<u8>> {
+    request_body(method, host, port, path, "", read_secs)
+}
+
+fn request_body(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    read_secs: u64,
+) -> Result<Vec<u8>> {
     let mut stream = TcpStream::connect((host, port))
         .with_context(|| format!("connect {host}:{port} (is `snared run` up?)"))?;
     stream.set_read_timeout(Some(Duration::from_secs(read_secs)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     stream.write_all(req.as_bytes())?;
 
@@ -48,6 +60,11 @@ pub fn get(host: &str, port: u16, path: &str) -> Result<Vec<u8>> {
 /// Longer read timeout: the daemon does a real round-trip before replying.
 pub fn post(host: &str, port: u16, path: &str) -> Result<Vec<u8>> {
     request("POST", host, port, path, 25)
+}
+
+/// POST `path` with a JSON `body` (used for intercept toggle/forward/drop).
+pub fn post_body(host: &str, port: u16, path: &str, body: &str) -> Result<Vec<u8>> {
+    request_body("POST", host, port, path, body, 25)
 }
 
 pub fn get_json<T: serde::de::DeserializeOwned>(host: &str, port: u16, path: &str) -> Result<T> {
