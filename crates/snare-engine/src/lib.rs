@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use http_body_util::{BodyExt, Full};
+use futures::StreamExt;
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{
@@ -41,6 +42,55 @@ use snare_core::ws::WsLog;
 use tokio::sync::broadcast;
 
 pub use ca::{generate_ca, GeneratedCa};
+
+/// Maximum request/response prefix retained in memory and persisted. Bodies
+/// larger than this are streamed through in full and marked as truncated in
+/// the capture model.
+pub const MAX_CAPTURE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+struct CapturedBody {
+    wire: Body,
+    captured: Vec<u8>,
+    truncated: bool,
+}
+
+/// Retain at most `limit` bytes while preserving the complete body (including
+/// trailers) for forwarding. Once the limit is crossed, the unread remainder
+/// stays streaming instead of being accumulated in memory.
+async fn capture_body(mut body: Body, limit: usize) -> Result<CapturedBody> {
+    let mut frames = Vec::new();
+    let mut captured = Vec::with_capacity(limit.min(64 * 1024));
+    let mut truncated = false;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.context("read HTTP body frame")?;
+        if let Some(data) = frame.data_ref() {
+            let remaining = limit.saturating_sub(captured.len());
+            if remaining > 0 {
+                captured.extend_from_slice(&data[..data.len().min(remaining)]);
+            }
+            truncated |= data.len() > remaining;
+        }
+        frames.push(frame);
+
+        if truncated {
+            let prefix = futures::stream::iter(frames.into_iter().map(Ok::<_, hudsucker::Error>));
+            let rest = BodyStream::new(body);
+            return Ok(CapturedBody {
+                wire: Body::from(StreamBody::new(prefix.chain(rest))),
+                captured,
+                truncated: true,
+            });
+        }
+    }
+
+    let frames = futures::stream::iter(frames.into_iter().map(Ok::<_, hudsucker::Error>));
+    Ok(CapturedBody {
+        wire: Body::from(StreamBody::new(frames)),
+        captured,
+        truncated: false,
+    })
+}
 
 /// Runtime configuration for the proxy.
 pub struct EngineConfig {
@@ -72,6 +122,13 @@ fn to_headers(map: &hudsucker::hyper::HeaderMap) -> Vec<Header> {
             )
         })
         .collect()
+}
+
+fn host_header_name(value: &str) -> String {
+    value
+        .parse::<hudsucker::hyper::http::uri::Authority>()
+        .map(|authority| authority.host().to_string())
+        .unwrap_or_else(|_| value.trim_matches(['[', ']']).to_string())
 }
 
 /// Apply an (edited) request model back onto the outgoing wire request. Used
@@ -177,27 +234,34 @@ impl HttpHandler for CaptureHandler {
             return req.into();
         }
         let (mut parts, body) = req.into_parts();
-        let bytes = match body.collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(_) => {
-                // couldn't buffer body — forward an empty one rather than drop
-                return Request::from_parts(parts, Body::empty()).into();
+        let captured_body = match capture_body(body, MAX_CAPTURE_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!("request body read failed: {e:#}");
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from("invalid request body"))
+                    .unwrap_or_else(|_| Response::new(Body::empty()))
+                    .into();
             }
         };
+        let CapturedBody {
+            wire,
+            captured,
+            truncated,
+        } = captured_body;
 
         let uri = &parts.uri;
         let host_hdr = parts
             .headers
             .get(hudsucker::hyper::header::HOST)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(':').next().unwrap_or(s).to_string());
-        let scheme = uri.scheme_str().map(|s| s.to_string()).unwrap_or_else(|| {
-            if uri.port_u16() == Some(443) {
-                "https".into()
-            } else {
-                "https".into() // MITM'd origin-form requests are TLS
-            }
-        });
+            .map(host_header_name);
+        // Origin-form requests seen here are the decrypted side of a CONNECT.
+        let scheme = uri
+            .scheme_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "https".into());
         let host = uri
             .host()
             .map(|s| s.to_string())
@@ -216,12 +280,15 @@ impl HttpHandler for CaptureHandler {
             query: uri.query().map(|q| q.to_string()),
             http_version: format!("{:?}", parts.version),
             headers: to_headers(&parts.headers),
-            body: bytes.to_vec(),
+            body: captured,
+            body_truncated: truncated,
         };
 
         // Match & Replace: automatic regex rewrites (with {{var}} injection)
         // before anything else sees it.
-        let mut dirty = self.rules.apply_request(&mut request, &self.vars.snapshot());
+        let mut dirty = self
+            .rules
+            .apply_request(&mut request, &self.vars.snapshot());
 
         // Interactive intercept (§5.1): hold the request at the breakpoint until
         // the operator forwards (optionally edited) or drops it.
@@ -258,11 +325,13 @@ impl HttpHandler for CaptureHandler {
         }
 
         // Rebuild the wire request once if rules or intercept changed it.
-        let forwarded_bytes = if dirty {
+        if dirty {
             rebuild_parts(&mut parts, &request);
-            bytes::Bytes::from(request.body.clone())
+        }
+        let forwarded_body = if dirty && !request.body_truncated {
+            Body::from(Full::new(bytes::Bytes::from(request.body.clone())))
         } else {
-            bytes
+            wire
         };
 
         let ts = snare_core::now_millis();
@@ -277,29 +346,43 @@ impl HttpHandler for CaptureHandler {
             Err(e) => tracing::warn!("store insert_request failed: {e:#}"),
         }
 
-        Request::from_parts(parts, Body::from(Full::new(forwarded_bytes))).into()
+        Request::from_parts(parts, forwarded_body).into()
     }
 
-    async fn handle_response(
-        &mut self,
-        _ctx: &HttpContext,
-        res: Response<Body>,
-    ) -> Response<Body> {
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         let (mut parts, body) = res.into_parts();
-        let bytes = match body.collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(_) => return Response::from_parts(parts, Body::empty()),
+        let captured_body = match capture_body(body, MAX_CAPTURE_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!("response body read failed: {e:#}");
+                parts.status = StatusCode::BAD_GATEWAY;
+                parts.headers.clear();
+                let msg = b"upstream response body failed".to_vec();
+                CapturedBody {
+                    wire: Body::from(Full::new(bytes::Bytes::from(msg.clone()))),
+                    captured: msg,
+                    truncated: false,
+                }
+            }
         };
+        let CapturedBody {
+            wire,
+            captured,
+            truncated,
+        } = captured_body;
 
         let mut response = HttpResponse {
             status: parts.status.as_u16(),
             http_version: format!("{:?}", parts.version),
             headers: to_headers(&parts.headers),
-            body: bytes.to_vec(),
+            body: captured,
+            body_truncated: truncated,
         };
 
         // Match & Replace on the response.
-        let mut dirty = self.rules.apply_response(&mut response, &self.vars.snapshot());
+        let mut dirty = self
+            .rules
+            .apply_response(&mut response, &self.vars.snapshot());
 
         let entry = self.pending.pop_front();
         let host = entry.as_ref().map(|(_, _, h)| h.as_str()).unwrap_or("");
@@ -323,6 +406,7 @@ impl HttpHandler for CaptureHandler {
                         http_version: response.http_version.clone(),
                         headers: vec![],
                         body: b"dropped by Snare".to_vec(),
+                        body_truncated: false,
                     };
                     dirty = true;
                 }
@@ -338,11 +422,13 @@ impl HttpHandler for CaptureHandler {
             }
         }
 
-        let resp_bytes = if dirty {
+        if dirty {
             rebuild_resp_parts(&mut parts, &response);
-            bytes::Bytes::from(response.body.clone())
+        }
+        let response_body = if dirty && !response.body_truncated {
+            Body::from(Full::new(bytes::Bytes::from(response.body.clone())))
         } else {
-            bytes
+            wire
         };
 
         if let Some((id, started, _)) = entry {
@@ -363,7 +449,7 @@ impl HttpHandler for CaptureHandler {
             }
         }
 
-        Response::from_parts(parts, Body::from(Full::new(resp_bytes)))
+        Response::from_parts(parts, response_body)
     }
 }
 
@@ -419,22 +505,32 @@ fn authority(cfg: &EngineConfig) -> Result<RcgenAuthority> {
     ))
 }
 
+/// Collaborators shared by each per-connection capture handler.
+pub struct EngineServices {
+    pub store: Arc<dyn FlowStore>,
+    pub events: broadcast::Sender<FlowEvent>,
+    pub intercept: Arc<Intercept>,
+    pub rules: Arc<Rules>,
+    pub scanner: Arc<Scanner>,
+    pub vars: Arc<Vars>,
+    pub wslog: Arc<WsLog>,
+}
+
 /// Run the proxy until `shutdown` resolves.
-pub async fn run<F>(
-    cfg: EngineConfig,
-    store: Arc<dyn FlowStore>,
-    events: broadcast::Sender<FlowEvent>,
-    intercept: Arc<Intercept>,
-    rules: Arc<Rules>,
-    scanner: Arc<Scanner>,
-    vars: Arc<Vars>,
-    wslog: Arc<WsLog>,
-    shutdown: F,
-) -> Result<()>
+pub async fn run<F>(cfg: EngineConfig, services: EngineServices, shutdown: F) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let ca = authority(&cfg)?;
+    let EngineServices {
+        store,
+        events,
+        intercept,
+        rules,
+        scanner,
+        vars,
+        wslog,
+    } = services;
     let handler = CaptureHandler {
         store,
         events: events.clone(),
@@ -459,4 +555,29 @@ where
     tracing::info!("proxy listening on {}", cfg.listen);
     proxy.start().await.context("proxy run")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_body_is_forwarded_in_full_and_capture_is_bounded() {
+        let input = bytes::Bytes::from_static(b"abcdefghij");
+        let captured = capture_body(Body::from(Full::new(input.clone())), 4)
+            .await
+            .unwrap();
+        assert_eq!(captured.captured, b"abcd");
+        assert!(captured.truncated);
+        let forwarded = captured.wire.collect().await.unwrap().to_bytes();
+        assert_eq!(forwarded, input);
+    }
+
+    #[tokio::test]
+    async fn small_body_is_captured_without_truncation() {
+        let captured = capture_body(Body::from("hello"), 16).await.unwrap();
+        assert_eq!(captured.captured, b"hello");
+        assert!(!captured.truncated);
+        assert_eq!(captured.wire.collect().await.unwrap().to_bytes(), "hello");
+    }
 }

@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use snare_core::model::{
-    Flow, FlowEvent, FlowSummary, Header, HttpRequest, HttpResponse, Source,
-};
+use snare_core::model::{Flow, FlowEvent, FlowSummary, Header, HttpRequest, HttpResponse, Source};
 use snare_core::store::FlowStore;
 use tokio::sync::broadcast;
+
+const MAX_RESPONSE_BODY_BYTES: usize = snare_engine::MAX_CAPTURE_BODY_BYTES;
 
 /// Hop-by-hop / client-managed headers we must not forward verbatim — reqwest
 /// sets its own, and forwarding a stale `accept-encoding` risks a body we can't
@@ -70,6 +70,7 @@ pub async fn send(
         http_version: "HTTP/1.1".into(),
         headers: headers.to_vec(),
         body: body.clone(),
+        body_truncated: false,
     };
 
     // Record the request immediately so it appears in the UI even while in flight.
@@ -96,7 +97,7 @@ pub async fn send(
     }
 
     let start = Instant::now();
-    let resp = rb.send().await.context("repeater request failed")?;
+    let mut resp = rb.send().await.context("repeater request failed")?;
     let status = resp.status().as_u16();
     let http_version = format!("{:?}", resp.version());
     let resp_headers: Vec<Header> = resp
@@ -109,7 +110,18 @@ pub async fn send(
             )
         })
         .collect();
-    let resp_body = resp.bytes().await.context("read repeater body")?.to_vec();
+    let mut resp_body = Vec::new();
+    let mut body_truncated = false;
+    while let Some(chunk) = resp.chunk().await.context("read repeater body")? {
+        let remaining = MAX_RESPONSE_BODY_BYTES.saturating_sub(resp_body.len());
+        if remaining > 0 {
+            resp_body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        if chunk.len() > remaining {
+            body_truncated = true;
+            break;
+        }
+    }
     let dur = start.elapsed().as_millis() as u64;
 
     let resp_model = HttpResponse {
@@ -117,6 +129,7 @@ pub async fn send(
         http_version,
         headers: resp_headers,
         body: resp_body,
+        body_truncated,
     };
     store.attach_response(id, &resp_model, dur)?;
 

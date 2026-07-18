@@ -40,14 +40,17 @@ pub fn start(
     let origin = random_origin();
 
     // Bridge: local broadcast (async) -> std channel -> NOTIFY thread (sync pg).
-    let (notify_tx, notify_rx) = mpsc::channel::<String>();
+    let (notify_tx, notify_rx) = mpsc::sync_channel::<String>(1024);
     let mut local_rx = local.subscribe();
     tokio::spawn(async move {
         while let Ok(ev) = local_rx.recv().await {
             if let Ok(json) = serde_json::to_string(&Wire { o: origin, e: ev }) {
                 // pg_notify payloads are capped (~8000 bytes); skip oversized ones.
-                if json.len() < 7800 && notify_tx.send(json).is_err() {
-                    break;
+                if json.len() < 7800 {
+                    match notify_tx.try_send(json) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
                 }
             }
         }
@@ -58,16 +61,30 @@ pub fn start(
     std::thread::Builder::new()
         .name("snare-pg-notify".into())
         .spawn(move || {
-            let mut client = match postgres::Client::connect(&notify_url, NoTls) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("pubsub notify connect failed: {e}");
-                    return;
-                }
-            };
+            let mut client = None;
             while let Ok(json) = notify_rx.recv() {
-                if let Err(e) = client.execute("SELECT pg_notify($1, $2)", &[&CHANNEL, &json]) {
-                    tracing::warn!("pg_notify failed: {e}");
+                loop {
+                    if client.is_none() {
+                        match postgres::Client::connect(&notify_url, NoTls) {
+                            Ok(connected) => client = Some(connected),
+                            Err(e) => {
+                                tracing::warn!("pubsub notify connect failed: {e}; retrying");
+                                std::thread::sleep(Duration::from_secs(2));
+                                continue;
+                            }
+                        }
+                    }
+                    let Some(connected) = client.as_mut() else {
+                        continue;
+                    };
+                    let result = connected.execute("SELECT pg_notify($1, $2)", &[&CHANNEL, &json]);
+                    match result {
+                        Ok(_) => break,
+                        Err(e) => {
+                            tracing::warn!("pg_notify failed: {e}; reconnecting");
+                            client = None;
+                        }
+                    }
                 }
             }
         })

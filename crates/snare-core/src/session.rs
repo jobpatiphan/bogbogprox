@@ -27,7 +27,10 @@ impl Vars {
     }
 
     pub fn set(&self, k: &str, v: &str) {
-        self.map.lock().unwrap().insert(k.to_string(), v.to_string());
+        self.map
+            .lock()
+            .unwrap()
+            .insert(k.to_string(), v.to_string());
     }
 
     pub fn remove(&self, k: &str) -> bool {
@@ -47,6 +50,7 @@ impl Vars {
 
     pub fn load(&self, items: Vec<(String, String)>) {
         let mut g = self.map.lock().unwrap();
+        g.clear();
         for (k, v) in items {
             g.insert(k, v);
         }
@@ -93,7 +97,12 @@ impl Macros {
     }
 
     pub fn get(&self, id: u64) -> Option<MacroSpec> {
-        self.list.lock().unwrap().iter().find(|m| m.id == id).cloned()
+        self.list
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
     }
 
     pub fn remove(&self, id: u64) -> bool {
@@ -105,6 +114,8 @@ impl Macros {
 
     pub fn load(&self, specs: Vec<MacroSpec>) {
         let mut g = self.list.lock().unwrap();
+        g.clear();
+        self.next_id.store(0, Ordering::Relaxed);
         for s in specs {
             if s.id > self.next_id.load(Ordering::Relaxed) {
                 self.next_id.store(s.id, Ordering::Relaxed);

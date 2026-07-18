@@ -6,7 +6,10 @@
 //! target with `SNARE_URL` (e.g. a remote `snared`).
 
 // Windows: no console window in a GUI build.
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 

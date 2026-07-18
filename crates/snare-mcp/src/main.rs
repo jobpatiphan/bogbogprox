@@ -2,104 +2,124 @@
 //!
 //! Exposes Snare's captured flows to AI agents. Phase-0 transport is a small
 //! hand-rolled JSON-RPC 2.0 loop (newline-delimited) — no external MCP SDK — so
-//! it is dependency-light and stable. It reads the SQLite store directly.
+//! it is dependency-light and stable. All operations go through the daemon API
+//! so local, Postgres, authenticated, and HTTPS deployments behave identically.
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use reqwest::blocking::{Client, Response};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use snare_core::store::{FlowQuery, FlowStore};
-use snare_store_sqlite::SqliteStore;
+use snare_core::model::{Flow, FlowSummary};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Resolve the daemon's REST host/port from `SNARE_API` (default localhost:9000).
-fn api_host_port() -> (String, u16) {
-    let base = std::env::var("SNARE_API").unwrap_or_else(|_| "http://127.0.0.1:9000".into());
-    let hostport = base
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("127.0.0.1:9000");
-    match hostport.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(9000u16)),
-        None => (hostport.to_string(), 9000u16),
+fn summary_url(flow: &FlowSummary) -> String {
+    let default_port =
+        (flow.scheme == "https" && flow.port == 443) || (flow.scheme == "http" && flow.port == 80);
+    let host = if flow.host.contains(':') && !flow.host.starts_with('[') {
+        format!("[{}]", flow.host)
+    } else {
+        flow.host.clone()
+    };
+    let authority = if default_port {
+        host
+    } else {
+        format!("{host}:{}", flow.port)
+    };
+    format!("{}://{}{}", flow.scheme, authority, flow.path)
+}
+
+struct ApiClient {
+    base: String,
+    token: Option<String>,
+    client: Client,
+}
+
+impl ApiClient {
+    fn from_env() -> Result<Self> {
+        let base = std::env::var("SNARE_API")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into())
+            .trim_end_matches('/')
+            .to_string();
+        reqwest::Url::parse(&base).context("invalid SNARE_API URL")?;
+        let token = std::env::var("SNARE_TOKEN").ok().filter(|v| !v.is_empty());
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        Ok(Self {
+            base,
+            token,
+            client,
+        })
     }
-}
 
-/// Best-effort: tell the running daemon what the agent is doing so it shows up
-/// on the live dashboard the instant it happens. Never fails the tool call —
-/// if the daemon isn't up, we just skip it.
-fn notify_activity(tool: &str, detail: &str) {
-    let (host, port) = api_host_port();
-    let agent = std::env::var("SNARE_AGENT").unwrap_or_else(|_| "ai-agent".into());
-    let body = json!({
-        "ts": snare_core::now_millis(),
-        "agent": agent,
-        "tool": tool,
-        "detail": detail,
-    })
-    .to_string();
-    if let Err(e) = post_json(&host, port, "/api/v1/activity", &body, 500) {
-        eprintln!("[snare-mcp] activity POST to {host}:{port} failed: {e}");
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
+        let request = self
+            .client
+            .request(method, format!("{}{}", self.base, path));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
-}
 
-/// POST `body` and return the full response body as a string (Connection:
-/// close → read to EOF). Used for tools that need the daemon's reply.
-fn post_read_body(host: &str, port: u16, path: &str, body: &str, read_timeout_ms: u64) -> std::io::Result<String> {
-    use std::io::{Read as _, Write as _};
-    let mut stream = std::net::TcpStream::connect((host, port))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_millis(500)))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(read_timeout_ms)))?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes())?;
-    stream.flush()?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
-    Ok(text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or_else(|| text.into_owned()))
-}
-
-/// Minimal one-shot HTTP/1.1 POST to localhost. Reads the first response bytes
-/// (which the daemon only sends once the handler has finished) so we both avoid
-/// racing the server read and know the request completed. `read_timeout_ms`
-/// bounds how long we wait — short for activity, long for a repeater round-trip.
-fn post_json(host: &str, port: u16, path: &str, body: &str, read_timeout_ms: u64) -> std::io::Result<()> {
-    use std::io::{Read as _, Write as _};
-    let mut stream = std::net::TcpStream::connect((host, port))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_millis(500)))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(read_timeout_ms)))?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes())?;
-    stream.flush()?;
-    let mut buf = [0u8; 256];
-    let _ = stream.read(&mut buf);
-    Ok(())
-}
-
-fn db_path() -> PathBuf {
-    if let Ok(home) = std::env::var("SNARE_HOME") {
-        return PathBuf::from(home).join("data").join("flows.sqlite");
+    fn checked(response: Response) -> Result<Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let detail = response.text().unwrap_or_default();
+        bail!("daemon returned HTTP {status}: {detail}")
     }
-    directories::ProjectDirs::from("dev", "Snare", "snare")
-        .map(|pd| pd.data_dir().join("flows.sqlite"))
-        .unwrap_or_else(|| PathBuf::from("flows.sqlite"))
+
+    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        Ok(Self::checked(self.request(reqwest::Method::GET, path).send()?)?.json()?)
+    }
+
+    fn get_query<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
+        Ok(Self::checked(
+            self.request(reqwest::Method::GET, path)
+                .query(query)
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    fn post<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
+        Ok(Self::checked(
+            self.request(reqwest::Method::POST, path)
+                .json(body)
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    fn notify_activity(&self, tool: &str, detail: &str) {
+        let agent = std::env::var("SNARE_AGENT").unwrap_or_else(|_| "ai-agent".into());
+        let body = json!({
+            "ts": snare_core::now_millis(),
+            "agent": agent,
+            "tool": tool,
+            "detail": detail,
+        });
+        let result = self
+            .request(reqwest::Method::POST, "/api/v1/activity")
+            .timeout(Duration::from_millis(750))
+            .json(&body)
+            .send()
+            .and_then(|response| response.error_for_status());
+        if let Err(e) = result {
+            eprintln!("[snare-mcp] activity notification failed: {e}");
+        }
+    }
 }
 
 fn main() -> Result<()> {
-    let store = SqliteStore::open(db_path())?;
+    let api = ApiClient::from_env()?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -125,7 +145,7 @@ fn main() -> Result<()> {
             continue;
         };
 
-        let reply = match handle(method, msg.get("params"), &store) {
+        let reply = match handle(method, msg.get("params"), &api) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(e) => json!({
                 "jsonrpc": "2.0",
@@ -139,10 +159,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle(method: &str, params: Option<&Value>, store: &SqliteStore) -> Result<Value> {
+fn handle(method: &str, params: Option<&Value>, api: &ApiClient) -> Result<Value> {
     match method {
         "initialize" => {
-            notify_activity("connect", "AI agent connected to Snare");
+            api.notify_activity("connect", "AI agent connected to Snare");
             Ok(json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
@@ -151,7 +171,7 @@ fn handle(method: &str, params: Option<&Value>, store: &SqliteStore) -> Result<V
         }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_specs() })),
-        "tools/call" => tools_call(params, store),
+        "tools/call" => tools_call(params, api),
         other => anyhow::bail!("method not found: {other}"),
     }
 }
@@ -237,6 +257,7 @@ fn format_flow(flow: &snare_core::model::Flow, part: &str) -> Value {
                 "http_version": flow.request.http_version,
                 "headers": flow.request.headers,
                 "body": String::from_utf8_lossy(&flow.request.body),
+                "body_truncated": flow.request.body_truncated,
             }),
         );
     }
@@ -248,6 +269,7 @@ fn format_flow(flow: &snare_core::model::Flow, part: &str) -> Value {
                     "status": resp.status,
                     "headers": resp.headers,
                     "body": String::from_utf8_lossy(&resp.body),
+                    "body_truncated": resp.body_truncated,
                 }),
             );
         }
@@ -281,8 +303,16 @@ fn summarize_call(name: &str, args: &Value) -> String {
             format!("resend flow #{id} via repeater")
         }
         "intruder_run" => {
-            let id = args.get("id").or_else(|| args.get("from_flow")).and_then(|i| i.as_i64()).unwrap_or(-1);
-            let n = args.get("payloads").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
+            let id = args
+                .get("id")
+                .or_else(|| args.get("from_flow"))
+                .and_then(|i| i.as_i64())
+                .unwrap_or(-1);
+            let n = args
+                .get("payloads")
+                .and_then(|p| p.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             format!("intruder: fuzz flow #{id} with {n} payloads")
         }
         "active_scan" => {
@@ -293,35 +323,42 @@ fn summarize_call(name: &str, args: &Value) -> String {
     }
 }
 
-fn tools_call(params: Option<&Value>, store: &SqliteStore) -> Result<Value> {
+fn tools_call(params: Option<&Value>, api: &ApiClient) -> Result<Value> {
     let params = params.cloned().unwrap_or_else(|| json!({}));
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     // Surface the intent on the live dashboard *before* running it, so the
     // operator sees what the agent is about to do in real time.
-    notify_activity(name, &summarize_call(name, &args));
+    api.notify_activity(name, &summarize_call(name, &args));
 
     match name {
         "proxy_stats" => {
-            let n = store.count()?;
-            Ok(text_result(json!({ "flows": n }).to_string()))
+            let stats: Value = api.get("/api/v1/stats")?;
+            Ok(text_result(stats.to_string()))
         }
         "proxy_list_flows" => {
-            let q = FlowQuery {
-                search: args.get("search").and_then(|s| s.as_str()).map(String::from),
-                host: None,
-                limit: args.get("limit").and_then(|l| l.as_i64()).unwrap_or(50),
-                offset: 0,
-            };
-            let flows = store.list_flows(&q)?;
+            let mut query = vec![(
+                "limit",
+                args.get("limit")
+                    .and_then(|l| l.as_i64())
+                    .unwrap_or(50)
+                    .to_string(),
+            )];
+            if let Some(search) = args.get("search").and_then(|s| s.as_str()) {
+                query.push(("search", search.to_string()));
+            }
+            let flows: Vec<FlowSummary> = api.get_query("/api/v1/flows", &query)?;
             let rows: Vec<Value> = flows
                 .iter()
                 .map(|f| {
                     json!({
                         "id": f.id,
                         "method": f.method,
-                        "url": format!("{}://{}{}", f.scheme, f.host, f.path),
+                        "url": summary_url(f),
                         "status": f.status,
                         "mime": f.mime,
                         "size": f.resp_size,
@@ -337,35 +374,20 @@ fn tools_call(params: Option<&Value>, store: &SqliteStore) -> Result<Value> {
                 .and_then(|i| i.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing `id`"))?;
             let part = args.get("part").and_then(|p| p.as_str()).unwrap_or("all");
-            let flow = store
-                .get_flow(id)?
-                .ok_or_else(|| anyhow::anyhow!("flow {id} not found"))?;
-            Ok(text_result(serde_json::to_string_pretty(&format_flow(&flow, part))?))
+            let flow: Flow = api.get(&format!("/api/v1/flows/{id}"))?;
+            Ok(text_result(serde_json::to_string_pretty(&format_flow(
+                &flow, part,
+            ))?))
         }
         "repeater_send" => {
             let id = args
                 .get("id")
                 .and_then(|i| i.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing `id`"))?;
-            let (host, port) = api_host_port();
-            // Trigger the send on the daemon (long timeout: it does a real round-trip).
-            post_json(&host, port, &format!("/api/v1/repeater/from/{id}"), "", 20_000)
-                .map_err(|e| anyhow::anyhow!("repeater send failed (is `snared run` up?): {e}"))?;
-            // The daemon stored the new flow before responding — it's now the newest.
-            let newest = store.list_flows(&FlowQuery {
-                search: None,
-                host: None,
-                limit: 1,
-                offset: 0,
-            })?;
-            let f = newest
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no flow after repeat"))?;
-            let flow = store
-                .get_flow(f.id)?
-                .ok_or_else(|| anyhow::anyhow!("repeated flow vanished"))?;
-            Ok(text_result(serde_json::to_string_pretty(&format_flow(&flow, "all"))?))
+            let flow: Flow = api.post(&format!("/api/v1/repeater/from/{id}"), &json!({}))?;
+            Ok(text_result(serde_json::to_string_pretty(&format_flow(
+                &flow, "all",
+            ))?))
         }
         "intruder_run" => {
             let from_flow = args
@@ -376,29 +398,63 @@ fn tools_call(params: Option<&Value>, store: &SqliteStore) -> Result<Value> {
                 .get("payloads")
                 .and_then(|p| p.as_array())
                 .ok_or_else(|| anyhow::anyhow!("missing `payloads` array"))?;
-            let (host, port) = api_host_port();
             let body = json!({
                 "from_flow": from_flow,
                 "marker": args.get("marker").and_then(|m| m.as_str()).unwrap_or("§"),
                 "payloads": payloads,
                 "concurrency": args.get("concurrency").and_then(|c| c.as_i64()).unwrap_or(10),
-            })
-            .to_string();
-            let out = post_read_body(&host, port, "/api/v1/intruder", &body, 60_000)
-                .map_err(|e| anyhow::anyhow!("intruder failed (is `snared run` up?): {e}"))?;
-            Ok(text_result(out))
+            });
+            let out: Value = api.post("/api/v1/intruder", &body)?;
+            Ok(text_result(serde_json::to_string_pretty(&out)?))
         }
         "active_scan" => {
             let from_flow = args
                 .get("from_flow")
                 .and_then(|i| i.as_i64())
                 .ok_or_else(|| anyhow::anyhow!("missing `from_flow`"))?;
-            let (host, port) = api_host_port();
-            let body = json!({ "from_flow": from_flow }).to_string();
-            let out = post_read_body(&host, port, "/api/v1/scan/active", &body, 60_000)
-                .map_err(|e| anyhow::anyhow!("active scan failed (is `snared run` up?): {e}"))?;
-            Ok(text_result(out))
+            let body = json!({ "from_flow": from_flow });
+            let out: Value = api.post("/api/v1/scan/active", &body)?;
+            Ok(text_result(serde_json::to_string_pretty(&out)?))
         }
         other => anyhow::bail!("unknown tool: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snare_core::model::Source;
+
+    fn summary(scheme: &str, host: &str, port: u16) -> FlowSummary {
+        FlowSummary {
+            id: 1,
+            ts: 0,
+            source: Source::Proxy,
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host: host.into(),
+            port,
+            path: "/health".into(),
+            status: Some(200),
+            mime: None,
+            resp_size: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn summary_url_preserves_non_default_ports_and_ipv6() {
+        assert_eq!(
+            summary_url(&summary("http", "127.0.0.1", 18081)),
+            "http://127.0.0.1:18081/health"
+        );
+        assert_eq!(
+            summary_url(&summary("https", "2001:db8::1", 8443)),
+            "https://[2001:db8::1]:8443/health"
+        );
+        assert_eq!(
+            summary_url(&summary("https", "example.test", 443)),
+            "https://example.test/health"
+        );
     }
 }

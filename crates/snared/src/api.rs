@@ -52,13 +52,13 @@ pub struct AppState {
     pub auth: Arc<crate::auth::Auth>,
     /// Cross-process events relayed from other daemons (topology B).
     pub remote_events: broadcast::Sender<FlowEvent>,
-    /// Where persisted settings are written.
-    pub config_path: std::path::PathBuf,
+    /// Local-file or shared-Postgres configuration backend.
+    pub config: crate::config::Backend,
 }
 
 impl AppState {
     /// Persist rules/scope/scanner/vars/macros after a mutation. Best-effort.
-    fn persist(&self) {
+    fn persist(&self, kind: &str) {
         let snap = crate::config::snapshot(
             &self.rules,
             &self.intercept,
@@ -66,13 +66,15 @@ impl AppState {
             &self.vars,
             &self.macros,
         );
-        crate::config::save(&self.config_path, &snap);
+        self.config.save_kind(kind, &snap);
     }
 
     /// Persist and tell other operators to reload this config kind (team mode).
     fn config_changed(&self, kind: &str) {
-        self.persist();
-        let _ = self.events.send(FlowEvent::ConfigChanged { kind: kind.into() });
+        self.persist(kind);
+        let _ = self
+            .events
+            .send(FlowEvent::ConfigChanged { kind: kind.into() });
     }
 }
 
@@ -89,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/api/v1/health", get(health))
         .route("/api/v1/team/join", post(team_join))
+        .route("/api/v1/team/logout", post(team_logout))
         .route("/api/v1/team/whoami", get(team_whoami))
         .route("/api/v1/operators", get(operators_list))
         .route("/api/v1/stats", get(stats))
@@ -98,12 +101,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/activity", post(post_activity))
         .route("/api/v1/repeater", post(repeater_custom))
         .route("/api/v1/repeater/from/:id", post(repeater_from))
-        .route("/api/v1/intercept", get(intercept_get).post(intercept_toggle))
+        .route(
+            "/api/v1/intercept",
+            get(intercept_get).post(intercept_toggle),
+        )
         .route("/api/v1/intercept/scope", post(intercept_scope))
         .route("/api/v1/intercept/:id/forward", post(intercept_forward))
         .route("/api/v1/intercept/:id/drop", post(intercept_drop))
-        .route("/api/v1/intercept/:id/forward-response", post(intercept_forward_resp))
-        .route("/api/v1/intercept/:id/drop-response", post(intercept_drop_resp))
+        .route(
+            "/api/v1/intercept/:id/forward-response",
+            post(intercept_forward_resp),
+        )
+        .route(
+            "/api/v1/intercept/:id/drop-response",
+            post(intercept_drop_resp),
+        )
         .route("/api/v1/rules", get(rules_list).post(rules_add))
         .route("/api/v1/rules/:id", axum::routing::delete(rules_delete))
         .route("/api/v1/rules/:id/toggle", post(rules_toggle))
@@ -144,17 +156,27 @@ async fn auth_mw(State(st): State<AppState>, mut req: Request, next: Next) -> Re
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::to_string);
-    let from_query = req.uri().query().and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("token="))
-            .map(str::to_string)
-    });
-    match from_header.or(from_query).and_then(|t| st.auth.verify_session(&t)) {
+    let from_query = (path == "/api/v1/stream")
+        .then(|| req.uri().query())
+        .flatten()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("token="))
+                .map(str::to_string)
+        });
+    match from_header
+        .or(from_query)
+        .and_then(|t| st.auth.verify_session(&t))
+    {
         Some(op) => {
             req.extensions_mut().insert(op);
             next.run(req).await
         }
-        None => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response(),
     }
 }
 
@@ -182,9 +204,16 @@ async fn team_join(State(st): State<AppState>, Json(b): Json<JoinBody>) -> Respo
         return Json(json!({ "auth": false, "session_token": null })).into_response();
     }
     if !st.auth.verify_project(&b.project_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid project token" }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid project token" })),
+        )
+            .into_response();
     }
-    let (token, op) = st.auth.create_session(b.display_name);
+    let (token, op) = match st.auth.create_session(b.display_name) {
+        Ok(session) => session,
+        Err(e) => return err(e),
+    };
     let _ = st.events.send(FlowEvent::Presence {
         operator: op.display_name.clone(),
         status: "join".into(),
@@ -196,6 +225,33 @@ async fn team_join(State(st): State<AppState>, Json(b): Json<JoinBody>) -> Respo
         "display_name": op.display_name,
     }))
     .into_response()
+}
+
+async fn team_logout(State(st): State<AppState>, req: Request) -> Response {
+    let operator = req
+        .extensions()
+        .get::<crate::auth::Operator>()
+        .map(|operator| operator.display_name.clone());
+    let token = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if token.is_some_and(|token| st.auth.revoke_session(token)) {
+        if let Some(operator) = operator {
+            let _ = st.events.send(FlowEvent::Presence {
+                operator,
+                status: "leave".into(),
+            });
+        }
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid session" })),
+        )
+            .into_response()
+    }
 }
 
 /// Operators currently online (seen within the presence window).
@@ -215,7 +271,10 @@ async fn team_whoami(State(st): State<AppState>, req: Request) -> Response {
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::to_string);
     match token.and_then(|t| st.auth.verify_session(&t)) {
-        Some(op) => Json(json!({ "auth": true, "authenticated": true, "display_name": op.display_name })).into_response(),
+        Some(op) => {
+            Json(json!({ "auth": true, "authenticated": true, "display_name": op.display_name }))
+                .into_response()
+        }
         None => Json(json!({ "auth": true, "authenticated": false })).into_response(),
     }
 }
@@ -249,9 +308,7 @@ async fn get_flow(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
 }
 
 /// Server-Sent-Events firehose: every flow + AI activity as it happens.
-async fn stream(
-    State(st): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn stream(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Merge the local event bus with the cross-process (remote) bus, so an
     // operator sees events from every proxy sharing this engagement.
     let to_event = |res: Result<FlowEvent, _>| match res {
@@ -290,10 +347,22 @@ pub struct RepeaterBody {
 /// Send a fully custom request through the repeater.
 async fn repeater_custom(State(st): State<AppState>, Json(b): Json<RepeaterBody>) -> Response {
     let (Some(method), Some(url)) = (b.method, b.url) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "method and url required" })))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "method and url required" })),
+        )
             .into_response();
     };
-    match repeater::send(&st.store, &st.events, snare_core::model::Source::Repeater, &method, &url, &b.headers, b.body.into_bytes()).await
+    match repeater::send(
+        &st.store,
+        &st.events,
+        snare_core::model::Source::Repeater,
+        &method,
+        &url,
+        &b.headers,
+        b.body.into_bytes(),
+    )
+    .await
     {
         Ok(flow) => Json(flow).into_response(),
         Err(e) => err(e),
@@ -305,13 +374,32 @@ async fn repeater_from(State(st): State<AppState>, Path(id): Path<i64>) -> Respo
     let flow = match st.store.get_flow(id) {
         Ok(Some(f)) => f,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "error": "flow not found" })))
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "flow not found" })),
+            )
                 .into_response()
         }
         Err(e) => return err(e),
     };
     let r = &flow.request;
-    match repeater::send(&st.store, &st.events, snare_core::model::Source::Repeater, &r.method, &r.url(), &r.headers, r.body.clone()).await
+    if r.body_truncated {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "request body was truncated during capture; refusing an unsafe partial replay" })),
+        )
+            .into_response();
+    }
+    match repeater::send(
+        &st.store,
+        &st.events,
+        snare_core::model::Source::Repeater,
+        &r.method,
+        &r.url(),
+        &r.headers,
+        r.body.clone(),
+    )
+    .await
     {
         Ok(flow) => Json(flow).into_response(),
         Err(e) => err(e),
@@ -405,7 +493,11 @@ async fn intercept_forward_resp(
     if st.intercept.forward_response(id, edit) {
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such held response" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such held response" })),
+        )
+            .into_response()
     }
 }
 
@@ -414,7 +506,11 @@ async fn intercept_drop_resp(State(st): State<AppState>, Path(id): Path<u64>) ->
     if st.intercept.discard_response(id) {
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such held response" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such held response" })),
+        )
+            .into_response()
     }
 }
 
@@ -454,7 +550,11 @@ async fn intercept_forward(
     if st.intercept.forward(id, edit) {
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such held request" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such held request" })),
+        )
+            .into_response()
     }
 }
 
@@ -463,7 +563,11 @@ async fn intercept_drop(State(st): State<AppState>, Path(id): Path<u64>) -> Resp
     if st.intercept.discard(id) {
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such held request" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such held request" })),
+        )
+            .into_response()
     }
 }
 
@@ -489,7 +593,10 @@ fn yes() -> bool {
 }
 
 async fn rules_add(State(st): State<AppState>, Json(b): Json<RuleBody>) -> Response {
-    match st.rules.add(b.name, b.part, b.pattern, b.replace, b.enabled) {
+    match st
+        .rules
+        .add(b.name, b.part, b.pattern, b.replace, b.enabled)
+    {
         Ok(spec) => {
             st.config_changed("rules");
             Json(spec).into_response()
@@ -503,7 +610,11 @@ async fn rules_delete(State(st): State<AppState>, Path(id): Path<u64>) -> Respon
         st.config_changed("rules");
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such rule" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such rule" })),
+        )
+            .into_response()
     }
 }
 
@@ -521,7 +632,11 @@ async fn rules_toggle(
         st.config_changed("rules");
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such rule" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such rule" })),
+        )
+            .into_response()
     }
 }
 
@@ -549,26 +664,68 @@ fn default_concurrency() -> usize {
 
 /// Fuzz a request template with a list of payloads, bounded-parallel.
 async fn intruder_run(State(st): State<AppState>, Json(b): Json<IntruderBody>) -> Response {
+    if b.marker.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "marker must not be empty" })),
+        )
+            .into_response();
+    }
+    if b.payloads.len() > 1_000 || b.payloads.iter().map(String::len).sum::<usize>() > 1_048_576 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "error": "intruder is limited to 1000 payloads / 1 MiB total" })),
+        )
+            .into_response();
+    }
     let base = match (b.base, b.from_flow) {
         (Some(rb), _) => {
             let (Some(method), Some(url)) = (rb.method, rb.url) else {
-                return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base needs method and url" }))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "base needs method and url" })),
+                )
+                    .into_response();
             };
             match intruder::base_from_request(method, &url, rb.headers, rb.body.into_bytes()) {
                 Ok(r) => r,
-                Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": e.to_string() })),
+                    )
+                        .into_response()
+                }
             }
         }
         (None, Some(id)) => match intruder::base_from_flow(&st.store, id) {
             Ok(r) => r,
-            Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
         },
         (None, None) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "from_flow or base required" }))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "from_flow or base required" })),
+            )
+                .into_response()
         }
     };
     let n = b.payloads.len();
-    let results = intruder::run(&st.store, &st.events, &base, &b.marker, b.payloads, b.concurrency).await;
+    let results = intruder::run(
+        &st.store,
+        &st.events,
+        &base,
+        &b.marker,
+        b.payloads,
+        b.concurrency,
+    )
+    .await;
     Json(json!({ "count": n, "results": results })).into_response()
 }
 
@@ -603,19 +760,44 @@ pub struct ActiveScanBody {
 
 /// Active-scan a captured flow's query parameters (XSS / SQLi probes).
 async fn active_scan_run(State(st): State<AppState>, Json(b): Json<ActiveScanBody>) -> Response {
-    let base = match intruder::base_from_flow(&st.store, b.from_flow) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
+    let flow = match st.store.get_flow(b.from_flow) {
+        Ok(Some(flow)) => flow,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "flow not found" })),
+            )
+                .into_response()
+        }
+        Err(e) => return err(e),
     };
-    let results = active_scan::scan(&st.store, &st.events, &st.scanner, &base).await;
+    if flow.request.body_truncated {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "request body was truncated; refusing an unsafe partial scan" })),
+        )
+            .into_response();
+    }
+    let results = active_scan::scan(
+        &st.store,
+        &st.events,
+        &st.scanner,
+        &flow.request,
+        flow.response.as_ref(),
+    )
+    .await;
     Json(json!({ "results": results })).into_response()
 }
 
 // ---- Session handling: variables & macros ----
 
 async fn vars_list(State(st): State<AppState>) -> Response {
-    let obj: serde_json::Map<String, serde_json::Value> =
-        st.vars.list().into_iter().map(|(k, v)| (k, json!(v))).collect();
+    let obj: serde_json::Map<String, serde_json::Value> = st
+        .vars
+        .list()
+        .into_iter()
+        .map(|(k, v)| (k, json!(v)))
+        .collect();
     Json(obj).into_response()
 }
 
@@ -676,22 +858,33 @@ async fn macros_delete(State(st): State<AppState>, Path(id): Path<u64>) -> Respo
         st.config_changed("macros");
         Json(json!({ "ok": true })).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such macro" }))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such macro" })),
+        )
+            .into_response()
     }
 }
 
 /// Run a macro: send its request, extract, store the variable. Returns the value.
 async fn macros_run(State(st): State<AppState>, Path(id): Path<u64>) -> Response {
     let Some(m) = st.macros.get(id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such macro" }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such macro" })),
+        )
+            .into_response();
     };
     match crate::macros::run(&st.store, &st.events, &st.vars, &m).await {
         Ok(Some(value)) => {
             st.config_changed("vars");
             Json(json!({ "ok": true, "var": m.var, "value": value })).into_response()
         }
-        Ok(None) => (StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "extract pattern did not match the response" }))).into_response(),
+        Ok(None) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "extract pattern did not match the response" })),
+        )
+            .into_response(),
         Err(e) => err(e),
     }
 }
@@ -719,14 +912,30 @@ async fn sequencer_run(State(st): State<AppState>, Json(b): Json<SequencerBody>)
     } else if let (Some(id), Some(extract)) = (b.from_flow, b.extract.as_deref()) {
         let base = match intruder::base_from_flow(&st.store, id) {
             Ok(r) => r,
-            Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
         };
         match sequencer::collect(&st.store, &st.events, &base, b.count, extract).await {
             Ok(t) => t,
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
         }
     } else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "provide tokens[] or from_flow+extract" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "provide tokens[] or from_flow+extract" })),
+        )
+            .into_response();
     };
     Json(sequencer::analyze(&tokens)).into_response()
 }
@@ -777,8 +986,13 @@ async fn report(State(st): State<AppState>, Query(p): Query<ReportParams>) -> Re
                 }]
             });
             (
-                [("content-type", "application/sarif+json"),
-                 ("content-disposition", "attachment; filename=\"snare-report.sarif\"")],
+                [
+                    ("content-type", "application/sarif+json"),
+                    (
+                        "content-disposition",
+                        "attachment; filename=\"snare-report.sarif\"",
+                    ),
+                ],
                 serde_json::to_string_pretty(&sarif).unwrap_or_default(),
             )
                 .into_response()
@@ -798,7 +1012,11 @@ async fn report(State(st): State<AppState>, Query(p): Query<ReportParams>) -> Re
             md.push_str(&format!("- Flows captured: **{flow_count}**\n"));
             md.push_str(&format!(
                 "- Findings: **{}** (high {}, medium {}, low {}, info {})\n\n",
-                findings.len(), counts[3], counts[2], counts[1], counts[0]
+                findings.len(),
+                counts[3],
+                counts[2],
+                counts[1],
+                counts[0]
             ));
             md.push_str("## Findings\n\n");
             if findings.is_empty() {
@@ -821,14 +1039,13 @@ async fn report(State(st): State<AppState>, Query(p): Query<ReportParams>) -> Re
                         Severity::Info => "INFO",
                     };
                     let detail = f.detail.replace('|', "\\|").replace('\n', " ");
-                    md.push_str(&format!("| {sev} | {} | {} | {} |\n", f.title, f.host, detail));
+                    md.push_str(&format!(
+                        "| {sev} | {} | {} | {} |\n",
+                        f.title, f.host, detail
+                    ));
                 }
             }
-            (
-                [("content-type", "text/markdown; charset=utf-8")],
-                md,
-            )
-                .into_response()
+            ([("content-type", "text/markdown; charset=utf-8")], md).into_response()
         }
     }
 }

@@ -30,8 +30,16 @@ pub async fn run(
         .collect();
     let body = template(&m.body, &snap).into_bytes();
 
-    let flow =
-        repeater::send(store, events, Source::Repeater, &m.method, &url, &headers, body).await?;
+    let flow = repeater::send(
+        store,
+        events,
+        Source::Repeater,
+        &m.method,
+        &url,
+        &headers,
+        body,
+    )
+    .await?;
 
     let re = Regex::new(&m.extract)?;
     if let Some(resp) = &flow.response {

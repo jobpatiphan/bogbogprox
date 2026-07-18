@@ -69,6 +69,26 @@ impl WsLog {
         self.msgs.lock().unwrap().clone()
     }
 
+    /// Retain a message received from another daemon without rebroadcasting it.
+    pub fn ingest(&self, msg: WsMessage) {
+        let mut g = self.msgs.lock().unwrap();
+        if g.iter().any(|m| {
+            m.ts == msg.ts
+                && m.host == msg.host
+                && m.direction == msg.direction
+                && m.kind == msg.kind
+                && m.data == msg.data
+        }) {
+            return;
+        }
+        self.next_id.fetch_max(msg.id, Ordering::Relaxed);
+        g.push(msg);
+        let len = g.len();
+        if len > 5000 {
+            g.drain(0..len - 5000);
+        }
+    }
+
     pub fn clear(&self) {
         self.msgs.lock().unwrap().clear();
     }

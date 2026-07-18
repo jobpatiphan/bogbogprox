@@ -51,7 +51,17 @@ pub async fn run(
 
         handles.push(tokio::spawn(async move {
             let _permit = permit; // released on drop
-            let row = match repeater::send(&store, &events, Source::Intruder, &method, &url, &headers, body).await {
+            let row = match repeater::send(
+                &store,
+                &events,
+                Source::Intruder,
+                &method,
+                &url,
+                &headers,
+                body,
+            )
+            .await
+            {
                 Ok(flow) => json!({
                     "payload": payload,
                     "flow_id": flow.id,
@@ -79,6 +89,9 @@ pub fn base_from_flow(store: &Arc<dyn FlowStore>, id: i64) -> Result<HttpRequest
     let flow = store
         .get_flow(id)?
         .ok_or_else(|| anyhow::anyhow!("flow {id} not found"))?;
+    if flow.request.body_truncated {
+        anyhow::bail!("flow {id} has a truncated request body and cannot be replayed safely");
+    }
     Ok(flow.request)
 }
 
@@ -105,5 +118,6 @@ pub fn base_from_request(
         http_version: "HTTP/1.1".into(),
         headers,
         body,
+        body_truncated: false,
     })
 }

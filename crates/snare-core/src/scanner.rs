@@ -9,6 +9,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Flow;
 
+fn cookie_has_attribute(cookie: &str, wanted: &str) -> bool {
+    cookie.split(';').skip(1).any(|part| {
+        part.trim()
+            .split_once('=')
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| part.trim())
+            .eq_ignore_ascii_case(wanted)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -72,11 +82,39 @@ impl Scanner {
 
     /// Record a finding discovered elsewhere (e.g. the active scanner). Not
     /// de-duped — active findings are per-probe and meant to be seen.
-    pub fn record(&self, flow_id: i64, severity: Severity, title: String, detail: String, host: String) -> Finding {
+    pub fn record(
+        &self,
+        flow_id: i64,
+        severity: Severity,
+        title: String,
+        detail: String,
+        host: String,
+    ) -> Finding {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let f = Finding { id, flow_id, severity, title, detail, host };
+        let f = Finding {
+            id,
+            flow_id,
+            severity,
+            title,
+            detail,
+            host,
+        };
         self.findings.lock().unwrap().push(f.clone());
         f
+    }
+
+    /// Retain a finding received from another daemon without rebroadcasting it.
+    pub fn ingest(&self, finding: Finding) {
+        let mut seen = self.seen.lock().unwrap();
+        let mut findings = self.findings.lock().unwrap();
+        if findings.iter().any(|f| {
+            f.flow_id == finding.flow_id && f.host == finding.host && f.title == finding.title
+        }) {
+            return;
+        }
+        self.next_id.fetch_max(finding.id, Ordering::Relaxed);
+        seen.insert(format!("{}|{}", finding.host, finding.title));
+        findings.push(finding);
     }
 
     /// Inspect a completed flow and return any *new* findings (also stored).
@@ -99,40 +137,68 @@ impl Scanner {
 
         if is_html {
             if !hdr("content-security-policy") {
-                raw.push((Severity::Low, "Missing Content-Security-Policy".into(),
-                    "No CSP header — reduces XSS/injection defence.".into()));
+                raw.push((
+                    Severity::Low,
+                    "Missing Content-Security-Policy".into(),
+                    "No CSP header — reduces XSS/injection defence.".into(),
+                ));
             }
-            if !hdr("x-frame-options") && !hdr("content-security-policy") {
-                raw.push((Severity::Low, "Missing X-Frame-Options".into(),
-                    "Page may be framable (clickjacking).".into()));
+            let csp_has_frame_ancestors = resp
+                .header("content-security-policy")
+                .is_some_and(|csp| csp.to_ascii_lowercase().contains("frame-ancestors"));
+            if !hdr("x-frame-options") && !csp_has_frame_ancestors {
+                raw.push((
+                    Severity::Low,
+                    "Missing X-Frame-Options".into(),
+                    "Page may be framable (clickjacking).".into(),
+                ));
             }
             if !hdr("x-content-type-options") {
-                raw.push((Severity::Info, "Missing X-Content-Type-Options".into(),
-                    "No `nosniff` — browser may MIME-sniff.".into()));
+                raw.push((
+                    Severity::Info,
+                    "Missing X-Content-Type-Options".into(),
+                    "No `nosniff` — browser may MIME-sniff.".into(),
+                ));
             }
         }
         if is_https && !hdr("strict-transport-security") {
-            raw.push((Severity::Low, "Missing HSTS".into(),
-                "HTTPS response without Strict-Transport-Security.".into()));
+            raw.push((
+                Severity::Low,
+                "Missing HSTS".into(),
+                "HTTPS response without Strict-Transport-Security.".into(),
+            ));
         }
         if let Some(server) = resp.header("server") {
             if server.chars().any(|c| c.is_ascii_digit()) {
-                raw.push((Severity::Info, "Server version disclosure".into(), format!("Server: {server}")));
+                raw.push((
+                    Severity::Info,
+                    "Server version disclosure".into(),
+                    format!("Server: {server}"),
+                ));
             }
         }
         if let Some(p) = resp.header("x-powered-by") {
-            raw.push((Severity::Info, "X-Powered-By disclosure".into(), format!("X-Powered-By: {p}")));
+            raw.push((
+                Severity::Info,
+                "X-Powered-By disclosure".into(),
+                format!("X-Powered-By: {p}"),
+            ));
         }
         for (k, v) in &resp.headers {
             if k.eq_ignore_ascii_case("set-cookie") {
-                let low = v.to_ascii_lowercase();
-                if !low.contains("httponly") {
-                    raw.push((Severity::Low, "Cookie without HttpOnly".into(),
-                        v.split(';').next().unwrap_or(v).to_string()));
+                if !cookie_has_attribute(v, "httponly") {
+                    raw.push((
+                        Severity::Low,
+                        "Cookie without HttpOnly".into(),
+                        v.split(';').next().unwrap_or(v).to_string(),
+                    ));
                 }
-                if is_https && !low.contains("secure") {
-                    raw.push((Severity::Low, "Cookie without Secure".into(),
-                        v.split(';').next().unwrap_or(v).to_string()));
+                if is_https && !cookie_has_attribute(v, "secure") {
+                    raw.push((
+                        Severity::Low,
+                        "Cookie without Secure".into(),
+                        v.split(';').next().unwrap_or(v).to_string(),
+                    ));
                 }
             }
         }
@@ -143,8 +209,11 @@ impl Scanner {
                 for pair in q.split('&') {
                     if let Some((name, val)) = pair.split_once('=') {
                         if val.len() >= 4 && body.contains(val) {
-                            raw.push((Severity::Medium, "Reflected parameter in response".into(),
-                                format!("`{name}={val}` reflected — check for XSS.")));
+                            raw.push((
+                                Severity::Medium,
+                                "Reflected parameter in response".into(),
+                                format!("`{name}={val}` reflected — check for XSS."),
+                            ));
                             break;
                         }
                     }
@@ -161,7 +230,14 @@ impl Scanner {
                 continue; // already reported for this host
             }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-            let f = Finding { id, flow_id: flow.id, severity, title, detail, host: host.clone() };
+            let f = Finding {
+                id,
+                flow_id: flow.id,
+                severity,
+                title,
+                detail,
+                host: host.clone(),
+            };
             store.push(f.clone());
             out.push(f);
         }
@@ -189,12 +265,14 @@ mod tests {
                 http_version: "HTTP/1.1".into(),
                 headers: vec![],
                 body: vec![],
+                body_truncated: false,
             },
             response: Some(HttpResponse {
                 status: 200,
                 http_version: "HTTP/1.1".into(),
                 headers: resp_headers,
                 body: b"<html></html>".to_vec(),
+                body_truncated: false,
             }),
             duration_ms: Some(1),
         }
@@ -204,7 +282,9 @@ mod tests {
     fn flags_missing_security_headers() {
         let s = Scanner::new();
         let found = s.scan(&flow(vec![("content-type".into(), "text/html".into())]));
-        assert!(found.iter().any(|f| f.title.contains("Content-Security-Policy")));
+        assert!(found
+            .iter()
+            .any(|f| f.title.contains("Content-Security-Policy")));
         assert!(found.iter().any(|f| f.title.contains("HSTS")));
     }
 
@@ -221,5 +301,11 @@ mod tests {
         let s = Scanner::new();
         s.set_enabled(false);
         assert!(s.scan(&flow(vec![])).is_empty());
+    }
+
+    #[test]
+    fn cookie_name_does_not_count_as_secure_attribute() {
+        assert!(!cookie_has_attribute("secureId=value; Path=/", "secure"));
+        assert!(cookie_has_attribute("id=value; Secure; HttpOnly", "secure"));
     }
 }

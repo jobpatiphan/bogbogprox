@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use snare_core::model::{Header, HttpRequest, Source};
+use snare_core::model::{Header, HttpRequest, HttpResponse, Source};
 use snare_core::scanner::{Scanner, Severity};
 use snare_core::store::FlowStore;
 use tokio::sync::broadcast;
@@ -32,8 +32,8 @@ const SQL_ERRORS: &[&str] = &[
 ];
 
 fn rebuild_url(base: &HttpRequest, new_query: &str) -> String {
-    let default_port = (base.scheme == "https" && base.port == 443)
-        || (base.scheme == "http" && base.port == 80);
+    let default_port =
+        (base.scheme == "https" && base.port == 443) || (base.scheme == "http" && base.port == 80);
     let authority = if default_port {
         base.host.clone()
     } else {
@@ -50,15 +50,16 @@ fn rebuild_url(base: &HttpRequest, new_query: &str) -> String {
 /// Encode a query back from pairs, injecting `payload` into the parameter at
 /// `target_idx`.
 fn query_with(pairs: &[(String, String)], target_idx: usize, payload: &str) -> String {
-    pairs
-        .iter()
-        .enumerate()
-        .map(|(i, (k, v))| {
-            let val = if i == target_idx { payload } else { v.as_str() };
-            format!("{k}={val}")
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        encoded.append_pair(key, if i == target_idx { payload } else { value });
+    }
+    encoded.finish()
+}
+
+fn contains_sql_error(body: &str) -> bool {
+    let low = body.to_ascii_lowercase();
+    SQL_ERRORS.iter().any(|error| low.contains(error))
 }
 
 /// Active-scan every query parameter of `base`. Returns one row per probe.
@@ -67,51 +68,63 @@ pub async fn scan(
     events: &broadcast::Sender<FlowEvent>,
     scanner: &Arc<Scanner>,
     base: &HttpRequest,
+    baseline: Option<&HttpResponse>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let Some(query) = &base.query else {
         return vec![json!({ "note": "no query parameters to test" })];
     };
-    let pairs: Vec<(String, String)> = query
-        .split('&')
-        .filter_map(|p| p.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
         .collect();
     if pairs.is_empty() {
         return vec![json!({ "note": "no key=value parameters to test" })];
     }
 
     let headers: Vec<Header> = base.headers.clone();
+    let baseline_has_sql_error = baseline
+        .map(|response| contains_sql_error(&String::from_utf8_lossy(&response.body)))
+        .unwrap_or(false);
     for (idx, (name, orig)) in pairs.iter().enumerate() {
-        let probes: [(&str, String, Severity, &str, fn(&str) -> bool); 2] = [
+        let probes: [(&str, String, Severity, &str); 2] = [
             (
                 "xss",
                 format!("{orig}\"'><{XSS_MARKER}>"),
-                Severity::High,
+                Severity::Medium,
                 "Reflected XSS",
-                (|body: &str| body.contains(&format!("<{XSS_MARKER}>"))) as fn(&str) -> bool,
             ),
             (
                 "sqli",
                 format!("{orig}'"),
-                Severity::High,
+                Severity::Medium,
                 "SQL error (possible injection)",
-                (|body: &str| {
-                    let low = body.to_ascii_lowercase();
-                    SQL_ERRORS.iter().any(|e| low.contains(e))
-                }) as fn(&str) -> bool,
             ),
         ];
-        for (kind, payload, sev, title, check) in probes {
+        for (kind, payload, sev, title) in probes {
             let q = query_with(&pairs, idx, &payload);
             let url = rebuild_url(base, &q);
-            match repeater::send(store, events, Source::Scanner, &base.method, &url, &headers, base.body.clone()).await {
+            match repeater::send(
+                store,
+                events,
+                Source::Scanner,
+                &base.method,
+                &url,
+                &headers,
+                base.body.clone(),
+            )
+            .await
+            {
                 Ok(flow) => {
                     let body = flow
                         .response
                         .as_ref()
                         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
                         .unwrap_or_default();
-                    let hit = check(&body);
+                    let hit = match kind {
+                        "xss" => body.contains(&format!("<{XSS_MARKER}>")),
+                        "sqli" => contains_sql_error(&body) && !baseline_has_sql_error,
+                        _ => false,
+                    };
                     if hit {
                         let f = scanner.record(
                             flow.id,
@@ -132,4 +145,27 @@ pub async fn scan(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_payload_is_encoded_without_changing_other_pairs() {
+        let pairs = vec![
+            ("q".into(), "hello world".into()),
+            ("page".into(), "1".into()),
+        ];
+        assert_eq!(
+            query_with(&pairs, 0, "\"'><x>"),
+            "q=%22%27%3E%3Cx%3E&page=1"
+        );
+    }
+
+    #[test]
+    fn detects_known_sql_errors_case_insensitively() {
+        assert!(contains_sql_error("Syntax error at or near SELECT"));
+        assert!(!contains_sql_error("normal response"));
+    }
 }

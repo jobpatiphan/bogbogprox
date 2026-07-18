@@ -10,6 +10,17 @@ pub struct Paths {
     pub data_dir: PathBuf,
 }
 
+/// Create an application-private directory and tighten an existing one.
+pub fn secure_dir(path: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 impl Paths {
     pub fn resolve() -> Result<Self> {
         // `SNARE_HOME` overrides everything (handy for tests / portable installs).

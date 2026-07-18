@@ -103,6 +103,8 @@ cargo build
 curl --proxy http://127.0.0.1:8888 --cacert <ca.pem> https://example.com
 ./target/debug/snared flows                 # list captured flows (CLI)
 ./target/debug/snare-tui                     # or watch them live in the TUI (r = resend)
+# optional managed Chromium profile (removed after the browser closes):
+./target/debug/snared browser --url https://example.com
 ```
 
 Ports are overridable: `snared run --proxy 127.0.0.1:9999 --api 127.0.0.1:9001`.
@@ -124,6 +126,12 @@ The `snare-mcp` binary is a stdio MCP server exposing `proxy_list_flows`,
 MCP client (e.g. Claude) at it to drive the captured traffic. It reports each
 call to the daemon,
 so the dashboard shows, live, what the agent is doing.
+Set `SNARE_API=https://...` and `SNARE_TOKEN=<session-token>` for an authenticated
+team server. The TUI supports the equivalent `--api` and `--token` flags.
+
+Captured bodies are bounded to 16 MiB in storage/UI. Larger bodies continue over
+the wire in full and are explicitly marked as truncated; unsafe partial replays
+are rejected.
 
 ### Roadmap
 

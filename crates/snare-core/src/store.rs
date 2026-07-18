@@ -27,12 +27,8 @@ pub trait FlowStore: Send + Sync + 'static {
     fn insert_request(&self, ts: i64, source: Source, req: &HttpRequest) -> anyhow::Result<i64>;
 
     /// Attach the response to an existing flow.
-    fn attach_response(
-        &self,
-        id: i64,
-        resp: &HttpResponse,
-        duration_ms: u64,
-    ) -> anyhow::Result<()>;
+    fn attach_response(&self, id: i64, resp: &HttpResponse, duration_ms: u64)
+        -> anyhow::Result<()>;
 
     /// List flow summaries newest-first.
     fn list_flows(&self, q: &FlowQuery) -> anyhow::Result<Vec<FlowSummary>>;

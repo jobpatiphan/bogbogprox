@@ -39,17 +39,26 @@ pub struct HttpRequest {
     pub headers: Vec<Header>,
     #[serde(with = "b64")]
     pub body: Vec<u8>,
+    /// True when Snare deliberately retained only the configured capture prefix.
+    /// The bytes forwarded on the wire are still complete.
+    #[serde(default)]
+    pub body_truncated: bool,
 }
 
 impl HttpRequest {
     /// Full URL reconstructed from parts.
     pub fn url(&self) -> String {
-        let default_port =
-            (self.scheme == "https" && self.port == 443) || (self.scheme == "http" && self.port == 80);
-        let authority = if default_port {
-            self.host.clone()
+        let default_port = (self.scheme == "https" && self.port == 443)
+            || (self.scheme == "http" && self.port == 80);
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
         } else {
-            format!("{}:{}", self.host, self.port)
+            self.host.clone()
+        };
+        let authority = if default_port {
+            host
+        } else {
+            format!("{}:{}", host, self.port)
         };
         let mut url = format!("{}://{}{}", self.scheme, authority, self.path);
         if let Some(q) = &self.query {
@@ -75,6 +84,9 @@ pub struct HttpResponse {
     pub headers: Vec<Header>,
     #[serde(with = "b64")]
     pub body: Vec<u8>,
+    /// True when Snare deliberately retained only the configured capture prefix.
+    #[serde(default)]
+    pub body_truncated: bool,
 }
 
 impl HttpResponse {
@@ -140,27 +152,54 @@ pub struct Activity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum FlowEvent {
-    FlowNew { summary: FlowSummary },
-    FlowUpdate { summary: FlowSummary },
+    FlowNew {
+        summary: FlowSummary,
+    },
+    FlowUpdate {
+        summary: FlowSummary,
+    },
     /// An AI agent invoked a tool against Snare.
-    Activity { activity: Activity },
+    Activity {
+        activity: Activity,
+    },
     /// A request is held at the intercept breakpoint, awaiting a decision.
-    InterceptPaused { id: u64, request: HttpRequest },
+    InterceptPaused {
+        id: u64,
+        request: HttpRequest,
+    },
     /// A response is held at the intercept breakpoint, awaiting a decision.
-    InterceptRespPaused { id: u64, response: HttpResponse },
+    InterceptRespPaused {
+        id: u64,
+        response: HttpResponse,
+    },
     /// A held request/response was forwarded or dropped ("forward" | "drop").
-    InterceptResolved { id: u64, action: String },
+    InterceptResolved {
+        id: u64,
+        action: String,
+    },
     /// Intercept toggles changed (`on` = requests, `responses` = responses).
-    InterceptState { on: bool, responses: bool },
+    InterceptState {
+        on: bool,
+        responses: bool,
+    },
     /// The passive scanner raised a finding.
-    Finding { finding: crate::scanner::Finding },
+    Finding {
+        finding: crate::scanner::Finding,
+    },
     /// A WebSocket message was captured.
-    WsMessage { msg: crate::ws::WsMessage },
+    WsMessage {
+        msg: crate::ws::WsMessage,
+    },
     /// Shared config changed (team mode) — clients reload the given kind
     /// ("rules" | "scope" | "vars" | "macros" | "scanner").
-    ConfigChanged { kind: String },
+    ConfigChanged {
+        kind: String,
+    },
     /// An operator joined or left (team mode); `status` = "join" | "leave".
-    Presence { operator: String, status: String },
+    Presence {
+        operator: String,
+        status: String,
+    },
 }
 
 /// Base64-encode bytes (used for binary WebSocket frames, etc.).
@@ -175,7 +214,7 @@ mod b64 {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(data: &[u8]) -> String {
-        let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
         for chunk in data.chunks(3) {
             let b = [
                 chunk[0],
@@ -211,22 +250,33 @@ mod b64 {
             }
         }
         let s = s.trim().as_bytes();
+        if s.len() & 3 != 0 {
+            return Err("invalid base64 length".into());
+        }
         let mut out = Vec::with_capacity(s.len() / 4 * 3);
-        for chunk in s.chunks(4) {
-            if chunk.is_empty() {
-                break;
+        let chunk_count = s.len() / 4;
+        for (index, chunk) in s.chunks_exact(4).enumerate() {
+            let is_last = index + 1 == chunk_count;
+            if chunk[0] == b'=' || chunk[1] == b'=' {
+                return Err("invalid base64 padding".into());
             }
-            let mut n = 0u32;
-            let mut pad = 0;
-            for (i, &c) in chunk.iter().enumerate() {
-                if c == b'=' {
-                    pad += 1;
-                    n <<= 6;
-                } else {
-                    n = n << 6 | val(c)?;
-                }
-                let _ = i;
+            let pad = match (chunk[2] == b'=', chunk[3] == b'=') {
+                (true, true) => 2,
+                (false, true) => 1,
+                (false, false) => 0,
+                (true, false) => return Err("invalid base64 padding".into()),
+            };
+            if pad > 0 && !is_last {
+                return Err("invalid base64 padding".into());
             }
+            let a = val(chunk[0])?;
+            let b = val(chunk[1])?;
+            let c = if pad < 2 { val(chunk[2])? } else { 0 };
+            let d = if pad == 0 { val(chunk[3])? } else { 0 };
+            if (pad == 2 && b & 0x0f != 0) || (pad == 1 && c & 0x03 != 0) {
+                return Err("invalid base64 trailing bits".into());
+            }
+            let n = a << 18 | b << 12 | c << 6 | d;
             out.push((n >> 16 & 0xFF) as u8);
             if pad < 2 {
                 out.push((n >> 8 & 0xFF) as u8);
@@ -245,5 +295,35 @@ mod b64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
         decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_brackets_ipv6_hosts() {
+        let request = HttpRequest {
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "::1".into(),
+            port: 8443,
+            path: "/health".into(),
+            query: None,
+            http_version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            body_truncated: false,
+        };
+        assert_eq!(request.url(), "https://[::1]:8443/health");
+    }
+
+    #[test]
+    fn base64_rejects_malformed_input() {
+        assert!(b64::decode("A").is_err());
+        assert!(b64::decode("====").is_err());
+        assert!(b64::decode("AA=A").is_err());
+        assert_eq!(b64::decode("aGVsbG8=").unwrap(), b"hello");
     }
 }

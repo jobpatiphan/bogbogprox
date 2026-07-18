@@ -160,7 +160,10 @@ impl Intercept {
     }
 
     /// Hold a response; returns its id and a receiver the engine awaits.
-    pub fn register_response(&self, response: HttpResponse) -> (u64, oneshot::Receiver<RespDecision>) {
+    pub fn register_response(
+        &self,
+        response: HttpResponse,
+    ) -> (u64, oneshot::Receiver<RespDecision>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending_resp
@@ -209,7 +212,13 @@ impl Intercept {
     /// Forward all held requests unedited (used when request intercept is
     /// turned off so nothing hangs).
     pub fn release_requests(&self) {
-        let reqs: Vec<Pending> = self.pending.lock().unwrap().drain().map(|(_, p)| p).collect();
+        let reqs: Vec<Pending> = self
+            .pending
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, p)| p)
+            .collect();
         for p in reqs {
             let _ = p.tx.send(Decision::Forward(Box::new(p.request)));
         }
@@ -218,8 +227,13 @@ impl Intercept {
     /// Forward all held responses unedited (used when response intercept is
     /// turned off).
     pub fn release_responses(&self) {
-        let resps: Vec<PendingResp> =
-            self.pending_resp.lock().unwrap().drain().map(|(_, p)| p).collect();
+        let resps: Vec<PendingResp> = self
+            .pending_resp
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, p)| p)
+            .collect();
         for p in resps {
             let _ = p.tx.send(RespDecision::Forward(Box::new(p.response)));
         }

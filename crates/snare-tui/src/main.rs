@@ -26,17 +26,22 @@ use snare_core::model::{Flow, FlowEvent, FlowSummary, Source};
 #[derive(Parser)]
 #[command(name = "snare-tui", version, about = "Snare terminal UI")]
 struct Cli {
+    /// Full API base URL. Overrides --host/--port and supports HTTPS.
+    #[arg(long)]
+    api: Option<String>,
     /// API host.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     /// API port.
     #[arg(long, default_value_t = 9000)]
     port: u16,
+    /// Team-mode session token (or set SNARE_TOKEN).
+    #[arg(long)]
+    token: Option<String>,
 }
 
 struct App {
-    host: String,
-    port: u16,
+    client: httpclient::ApiClient,
     /// Newest-first, mirroring the REST list order.
     flows: Vec<FlowSummary>,
     state: ListState,
@@ -56,11 +61,10 @@ struct App {
 }
 
 impl App {
-    fn new(host: String, port: u16) -> Self {
-        let events = sse::subscribe(host.clone(), port);
+    fn new(client: httpclient::ApiClient) -> Self {
+        let events = sse::subscribe(client.clone());
         Self {
-            host,
-            port,
+            client,
             flows: Vec::new(),
             state: ListState::default(),
             selected_id: None,
@@ -78,8 +82,9 @@ impl App {
     /// Full reload from REST — the initial snapshot and a periodic self-heal in
     /// case the SSE stream drops.
     fn refresh(&mut self) {
-        if let Ok(flows) =
-            httpclient::get_json::<Vec<FlowSummary>>(&self.host, self.port, "/api/v1/flows?limit=500")
+        if let Ok(flows) = self
+            .client
+            .get_json::<Vec<FlowSummary>>("/api/v1/flows?limit=500")
         {
             self.flows = flows;
             self.status = format!("{} flows", self.flows.len());
@@ -113,7 +118,10 @@ impl App {
                     let label = if activity.tool == "connect" {
                         format!("🤖 {} connected", activity.agent)
                     } else {
-                        format!("🤖 {} → {} · {}", activity.agent, activity.tool, activity.detail)
+                        format!(
+                            "🤖 {} → {} · {}",
+                            activity.agent, activity.tool, activity.detail
+                        )
                     };
                     self.activity = Some((label, Instant::now()));
                 }
@@ -124,7 +132,8 @@ impl App {
                     self.held.push_back((id, false, label));
                 }
                 FlowEvent::InterceptRespPaused { id, response } => {
-                    self.held.push_back((id, true, format!("response {}", response.status)));
+                    self.held
+                        .push_back((id, true, format!("response {}", response.status)));
                 }
                 FlowEvent::InterceptResolved { id, .. } => {
                     self.held.retain(|(hid, _, _)| *hid != id);
@@ -134,8 +143,15 @@ impl App {
                     self.activity = Some((format!("⚠ {}", finding.title), Instant::now()));
                 }
                 FlowEvent::WsMessage { msg } => {
-                    let arrow = if msg.direction == "send" { "▲" } else { "▼" };
-                    self.activity = Some((format!("🔌 {arrow} {} {}", msg.host, msg.kind), Instant::now()));
+                    let arrow = if msg.direction == "send" {
+                        "▲"
+                    } else {
+                        "▼"
+                    };
+                    self.activity = Some((
+                        format!("🔌 {arrow} {} {}", msg.host, msg.kind),
+                        Instant::now(),
+                    ));
                 }
                 FlowEvent::Presence { operator, status } => {
                     self.activity = Some((format!("👤 {operator} {status}"), Instant::now()));
@@ -177,10 +193,10 @@ impl App {
             return;
         }
         self.detail = match self.selected_id {
-            Some(id) => {
-                httpclient::get_json::<Flow>(&self.host, self.port, &format!("/api/v1/flows/{id}"))
-                    .ok()
-            }
+            Some(id) => self
+                .client
+                .get_json::<Flow>(&format!("/api/v1/flows/{id}"))
+                .ok(),
             None => None,
         };
         self.detail_for = self.selected_id;
@@ -208,7 +224,10 @@ impl App {
     /// also arrives via the live stream, but we jump to it immediately.
     fn resend(&mut self) {
         let Some(id) = self.selected_id else { return };
-        match httpclient::post_json::<Flow>(&self.host, self.port, &format!("/api/v1/repeater/from/{id}")) {
+        match self
+            .client
+            .post_json::<Flow>(&format!("/api/v1/repeater/from/{id}"))
+        {
             Ok(flow) => {
                 let new_id = flow.id;
                 if !self.flows.iter().any(|f| f.id == new_id) {
@@ -230,7 +249,7 @@ impl App {
     /// Toggle request intercept (state syncs back via the SSE event).
     fn toggle_intercept(&mut self) {
         let body = format!("{{\"on\":{}}}", !self.intercept_on);
-        let _ = httpclient::post_body(&self.host, self.port, "/api/v1/intercept", &body);
+        let _ = self.client.post_body("/api/v1/intercept", &body);
     }
 
     /// Forward (as-is) or drop the oldest held item. Editing is Web-only.
@@ -244,7 +263,7 @@ impl App {
             (true, false) => format!("/api/v1/intercept/{id}/forward-response"),
             (true, true) => format!("/api/v1/intercept/{id}/drop-response"),
         };
-        if httpclient::post(&self.host, self.port, &path).is_ok() {
+        if self.client.post(&path).is_ok() {
             self.held.retain(|(hid, _, _)| *hid != id);
         }
     }
@@ -261,7 +280,10 @@ fn summary_from(flow: &Flow) -> FlowSummary {
         port: flow.request.port,
         path: flow.request.path.clone(),
         status: flow.response.as_ref().map(|r| r.status),
-        mime: flow.response.as_ref().and_then(|r| r.mime().map(String::from)),
+        mime: flow
+            .response
+            .as_ref()
+            .and_then(|r| r.mime().map(String::from)),
         resp_size: flow.response.as_ref().map(|r| r.body.len() as u64),
         duration_ms: flow.duration_ms,
     }
@@ -269,13 +291,21 @@ fn summary_from(flow: &Flow) -> FlowSummary {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let api = cli
+        .api
+        .unwrap_or_else(|| format!("http://{}:{}", cli.host, cli.port));
+    let token = cli
+        .token
+        .or_else(|| std::env::var("SNARE_TOKEN").ok())
+        .filter(|token| !token.is_empty());
+    let client = httpclient::ApiClient::new(api, token)?;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(cli.host, cli.port);
+    let mut app = App::new(client);
     app.refresh(); // initial snapshot
     let res = run(&mut terminal, &mut app);
 
@@ -324,11 +354,21 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) 
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let mut title_spans = vec![
-        Span::styled(" 🪤 Snare ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " 🪤 Snare ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(app.status.clone(), Style::default().fg(Color::Cyan)),
     ];
@@ -336,7 +376,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         title_spans.push(Span::raw("  "));
         title_spans.push(Span::styled(
             " ⏸ INTERCEPT ",
-            Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     // A held request/response takes priority in the header.
@@ -358,7 +401,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             title_spans.push(Span::raw("   "));
             title_spans.push(Span::styled(
                 label.clone(),
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
     }
@@ -373,7 +418,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .flows
         .iter()
         .map(|fl| {
-            let status = fl.status.map(|s| s.to_string()).unwrap_or_else(|| "···".into());
+            let status = fl
+                .status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "···".into());
             let color = match fl.status {
                 Some(s) if s < 300 => Color::Green,
                 Some(s) if s < 400 => Color::Cyan,
@@ -381,11 +429,18 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 Some(_) => Color::Red,
                 None => Color::DarkGray,
             };
-            let tag = if fl.source == Source::Repeater { "↻" } else { " " };
+            let tag = if fl.source == Source::Repeater {
+                "↻"
+            } else {
+                " "
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{tag} "), Style::default().fg(Color::Yellow)),
                 Span::styled(format!("{status:>3} "), Style::default().fg(color)),
-                Span::styled(format!("{:<5} ", fl.method), Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    format!("{:<5} ", fl.method),
+                    Style::default().fg(Color::Magenta),
+                ),
                 Span::raw(format!("{}{}", fl.host, fl.path)),
             ]))
         })
@@ -394,7 +449,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let mut list_state = app.state.clone();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" flows "))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, body[0], &mut list_state);
 
@@ -413,7 +472,9 @@ fn detail_widget<'a>(app: &'a App) -> Paragraph<'a> {
         let req = &flow.request;
         lines.push(Line::from(Span::styled(
             format!("{} {}", req.method, req.url()),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         for (k, v) in req.headers.iter().take(20) {
             lines.push(Line::from(vec![
@@ -425,11 +486,19 @@ fn detail_widget<'a>(app: &'a App) -> Paragraph<'a> {
             lines.push(Line::from(""));
             lines.push(body_preview("request body", &req.body));
         }
+        if req.body_truncated {
+            lines.push(Line::from(Span::styled(
+                "[capture truncated; wire body was complete]",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
         lines.push(Line::from(""));
         if let Some(resp) = &flow.response {
             lines.push(Line::from(Span::styled(
                 format!("← {} ({} bytes)", resp.status, resp.body.len()),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )));
             for (k, v) in resp.headers.iter().take(20) {
                 lines.push(Line::from(vec![
@@ -440,6 +509,12 @@ fn detail_widget<'a>(app: &'a App) -> Paragraph<'a> {
             if !resp.body.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(body_preview("response body", &resp.body));
+            }
+            if resp.body_truncated {
+                lines.push(Line::from(Span::styled(
+                    "[capture truncated; wire body was complete]",
+                    Style::default().fg(Color::Yellow),
+                )));
             }
         } else {
             lines.push(Line::from(Span::styled(

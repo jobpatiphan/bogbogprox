@@ -9,12 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use snare_core::model::{
-    Flow, FlowSummary, Header, HttpRequest, HttpResponse, Source,
-};
+use snare_core::model::{Flow, FlowSummary, Header, HttpRequest, HttpResponse, Source};
 use snare_core::store::{FlowQuery, FlowStore};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -24,8 +22,12 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Open (creating if needed) a store at `path`. Use `":memory:"` for tests.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        secure_create(path)?;
         let conn = Connection::open(path).context("open sqlite db")?;
-        Self::init(conn)
+        let store = Self::init(conn)?;
+        secure_sidecars(path);
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -55,10 +57,12 @@ impl SqliteStore {
                 http_version  TEXT    NOT NULL,
                 req_headers   TEXT    NOT NULL,
                 req_body      BLOB    NOT NULL,
+                req_body_truncated INTEGER NOT NULL DEFAULT 0,
                 status        INTEGER,
                 resp_version  TEXT,
                 resp_headers  TEXT,
                 resp_body     BLOB,
+                resp_body_truncated INTEGER NOT NULL DEFAULT 0,
                 mime          TEXT,
                 resp_size     INTEGER,
                 duration_ms   INTEGER
@@ -77,11 +81,27 @@ impl SqliteStore {
             .optional()?
             .and_then(|s| s.parse().ok());
 
-        if current.is_none() {
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
-                params![SCHEMA_VERSION.to_string()],
-            )?;
+        match current {
+            None => {
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+                    params![SCHEMA_VERSION.to_string()],
+                )?;
+            }
+            Some(1) => {
+                conn.execute_batch(
+                    "ALTER TABLE flows ADD COLUMN req_body_truncated INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE flows ADD COLUMN resp_body_truncated INTEGER NOT NULL DEFAULT 0;",
+                )?;
+                conn.execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    params![SCHEMA_VERSION.to_string()],
+                )?;
+            }
+            Some(v) if v > SCHEMA_VERSION => {
+                anyhow::bail!("database schema {v} is newer than supported {SCHEMA_VERSION}");
+            }
+            Some(_) => {}
         }
         // (forward-only migrations dispatch on `current` here in later phases)
 
@@ -90,6 +110,50 @@ impl SqliteStore {
         })
     }
 }
+
+#[cfg(unix)]
+fn secure_create(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        anyhow::bail!("refusing symlinked sqlite database {}", path.display());
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create secure sqlite db {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_create(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_sidecars(path: &Path) {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    for suffix in [b"-wal".as_slice(), b"-shm".as_slice()] {
+        let mut name = path.as_os_str().to_owned().into_vec();
+        name.extend_from_slice(suffix);
+        let sidecar = std::path::PathBuf::from(std::ffi::OsString::from_vec(name));
+        if sidecar.exists() {
+            let _ = std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn secure_sidecars(_path: &Path) {}
 
 fn headers_to_json(headers: &[Header]) -> String {
     serde_json::to_string(headers).unwrap_or_else(|_| "[]".into())
@@ -105,8 +169,8 @@ impl FlowStore for SqliteStore {
         conn.execute(
             r#"INSERT INTO flows
                 (ts, source, scheme, method, host, port, path, query,
-                 http_version, req_headers, req_body)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"#,
+                 http_version, req_headers, req_body, req_body_truncated)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
             params![
                 ts,
                 source.as_str(),
@@ -119,6 +183,7 @@ impl FlowStore for SqliteStore {
                 req.http_version,
                 headers_to_json(&req.headers),
                 req.body,
+                req.body_truncated,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -129,7 +194,8 @@ impl FlowStore for SqliteStore {
         conn.execute(
             r#"UPDATE flows SET
                 status = ?2, resp_version = ?3, resp_headers = ?4,
-                resp_body = ?5, mime = ?6, resp_size = ?7, duration_ms = ?8
+                resp_body = ?5, resp_body_truncated = ?6,
+                mime = ?7, resp_size = ?8, duration_ms = ?9
                WHERE id = ?1"#,
             params![
                 id,
@@ -137,6 +203,7 @@ impl FlowStore for SqliteStore {
                 resp.http_version,
                 headers_to_json(&resp.headers),
                 resp.body,
+                resp.body_truncated,
                 resp.mime(),
                 resp.body.len() as i64,
                 duration_ms as i64,
@@ -174,8 +241,9 @@ impl FlowStore for SqliteStore {
         sql.push_str(&(args.len() + 2).to_string());
 
         let mut stmt = conn.prepare(&sql)?;
-        let mut bind: Vec<&dyn rusqlite::ToSql> = args.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let limit = q.limit.max(1);
+        let mut bind: Vec<&dyn rusqlite::ToSql> =
+            args.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let limit = q.limit.clamp(1, 1_000);
         let offset = q.offset.max(0);
         bind.push(&limit);
         bind.push(&offset);
@@ -203,8 +271,9 @@ impl FlowStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             r#"SELECT id, ts, source, scheme, method, host, port, path, query,
-                      http_version, req_headers, req_body,
-                      status, resp_version, resp_headers, resp_body, duration_ms
+                      http_version, req_headers, req_body, req_body_truncated,
+                      status, resp_version, resp_headers, resp_body,
+                      resp_body_truncated, duration_ms
                FROM flows WHERE id = ?1"#,
             params![id],
             |r| {
@@ -218,16 +287,18 @@ impl FlowStore for SqliteStore {
                     http_version: r.get(9)?,
                     headers: headers_from_json(&r.get::<_, String>(10)?),
                     body: r.get(11)?,
+                    body_truncated: r.get(12)?,
                 };
-                let status: Option<u16> = r.get(12)?;
+                let status: Option<u16> = r.get(13)?;
                 let response = match status {
                     Some(status) => Some(HttpResponse {
                         status,
-                        http_version: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                        http_version: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
                         headers: headers_from_json(
-                            &r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                            &r.get::<_, Option<String>>(15)?.unwrap_or_default(),
                         ),
-                        body: r.get::<_, Option<Vec<u8>>>(15)?.unwrap_or_default(),
+                        body: r.get::<_, Option<Vec<u8>>>(16)?.unwrap_or_default(),
+                        body_truncated: r.get(17)?,
                     }),
                     None => None,
                 };
@@ -237,7 +308,7 @@ impl FlowStore for SqliteStore {
                     source: source_from_str(&r.get::<_, String>(2)?),
                     request,
                     response,
-                    duration_ms: r.get::<_, Option<i64>>(16)?.map(|v| v as u64),
+                    duration_ms: r.get::<_, Option<i64>>(18)?.map(|v| v as u64),
                 })
             },
         )
@@ -281,13 +352,16 @@ mod tests {
             http_version: "HTTP/1.1".into(),
             headers: vec![("Host".into(), "example.com".into())],
             body: Vec::new(),
+            body_truncated: false,
         }
     }
 
     #[test]
     fn insert_and_read_back() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let id = store.insert_request(123, Source::Proxy, &sample_req()).unwrap();
+        let id = store
+            .insert_request(123, Source::Proxy, &sample_req())
+            .unwrap();
         assert_eq!(store.count().unwrap(), 1);
 
         let resp = HttpResponse {
@@ -295,6 +369,7 @@ mod tests {
             http_version: "HTTP/1.1".into(),
             headers: vec![("Content-Type".into(), "application/json".into())],
             body: b"{\"ok\":true}".to_vec(),
+            body_truncated: false,
         };
         store.attach_response(id, &resp, 42).unwrap();
 
@@ -302,6 +377,8 @@ mod tests {
         assert_eq!(flow.request.url(), "https://example.com/api/orders?id=1");
         assert_eq!(flow.response.as_ref().unwrap().status, 200);
         assert_eq!(flow.duration_ms, Some(42));
+        assert!(!flow.request.body_truncated);
+        assert!(!flow.response.as_ref().unwrap().body_truncated);
 
         let list = store.list_flows(&FlowQuery::new()).unwrap();
         assert_eq!(list.len(), 1);
@@ -312,7 +389,9 @@ mod tests {
     #[test]
     fn search_filters() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.insert_request(1, Source::Proxy, &sample_req()).unwrap();
+        store
+            .insert_request(1, Source::Proxy, &sample_req())
+            .unwrap();
         let mut other = sample_req();
         other.host = "other.test".into();
         store.insert_request(2, Source::Proxy, &other).unwrap();
@@ -324,5 +403,57 @@ mod tests {
         q.search = None;
         q.host = Some("other".into());
         assert_eq!(store.list_flows(&q).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "snare-sqlite-perms-{}-{}.sqlite",
+            std::process::id(),
+            snare_core::now_millis()
+        ));
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn migrates_v1_truncation_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "snare-sqlite-v1-{}-{}.sqlite",
+            std::process::id(),
+            snare_core::now_millis()
+        ));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key,value) VALUES('schema_version','1');
+             CREATE TABLE flows (id INTEGER PRIMARY KEY, ts INTEGER, host TEXT);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteStore::open(&path).unwrap();
+        let columns: Vec<String> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(flows)").unwrap();
+            stmt.query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert!(columns.contains(&"req_body_truncated".to_string()));
+        assert!(columns.contains(&"resp_body_truncated".to_string()));
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }

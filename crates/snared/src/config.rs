@@ -5,7 +5,8 @@
 //! you don't want intercept silently re-armed after a restart) and findings
 //! (derived from traffic).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use snare_core::intercept::Intercept;
@@ -30,15 +31,93 @@ fn yes() -> bool {
     true
 }
 
-/// Read persisted settings, or `None` if there's no config file yet (so first
-/// run keeps in-code defaults).
-pub fn load(path: &Path) -> Option<Persisted> {
-    let bytes = std::fs::read(path).ok()?;
-    match serde_json::from_slice(&bytes) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::warn!("ignoring malformed config {}: {e}", path.display());
-            None
+#[derive(Clone)]
+pub enum Backend {
+    Local(PathBuf),
+    Postgres(snare_store_postgres::PostgresStore),
+}
+
+impl Backend {
+    pub fn load(&self) -> Option<Persisted> {
+        let bytes = match self {
+            Self::Local(path) => {
+                if path.exists() {
+                    if std::fs::symlink_metadata(path)
+                        .map(|metadata| metadata.file_type().is_symlink())
+                        .unwrap_or(false)
+                    {
+                        tracing::warn!("refusing symlinked config {}", path.display());
+                        return None;
+                    }
+                    if let Err(e) = secure_file(path) {
+                        tracing::warn!("could not secure config {}: {e:#}", path.display());
+                    }
+                }
+                std::fs::read(path).ok()?
+            }
+            Self::Postgres(store) => match store.load_setting("shared_config") {
+                Ok(Some(value)) => value.into_bytes(),
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!("could not load shared Postgres config: {e:#}");
+                    return None;
+                }
+            },
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("ignoring malformed persisted config: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn save(&self, persisted: &Persisted) {
+        let bytes = match serde_json::to_vec_pretty(persisted) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!("could not serialize config: {e}");
+                return;
+            }
+        };
+        let result = match self {
+            Self::Local(path) => save_local(path, &bytes),
+            Self::Postgres(store) => {
+                store.save_setting("shared_config", &String::from_utf8_lossy(&bytes))
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!("could not save persisted config: {e:#}");
+        }
+    }
+
+    pub fn save_kind(&self, kind: &str, persisted: &Persisted) {
+        let Self::Postgres(store) = self else {
+            self.save(persisted);
+            return;
+        };
+        let (field, value) = match kind {
+            "rules" => ("rules", serde_json::to_string(&persisted.rules)),
+            "scope" => ("scope", serde_json::to_string(&persisted.scope)),
+            "scanner" => (
+                "scanner_enabled",
+                serde_json::to_string(&persisted.scanner_enabled),
+            ),
+            "vars" => ("vars", serde_json::to_string(&persisted.vars)),
+            "macros" => ("macros", serde_json::to_string(&persisted.macros)),
+            _ => {
+                self.save(persisted);
+                return;
+            }
+        };
+        match value {
+            Ok(value) => {
+                if let Err(e) = store.save_setting_field("shared_config", field, &value) {
+                    tracing::warn!("could not save shared {kind} config: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("could not serialize shared {kind} config: {e}"),
         }
     }
 }
@@ -52,13 +131,8 @@ pub fn apply(
     vars: &Vars,
     macros: &Macros,
 ) {
-    for r in &p.rules {
-        // Re-add each rule; a bad regex (shouldn't happen — it was valid once) is
-        // skipped rather than aborting startup.
-        if let Err(e) = rules.add(r.name.clone(), r.part, r.pattern.clone(), r.replace.clone(), r.enabled)
-        {
-            tracing::warn!("dropping saved rule {:?}: {e}", r.name);
-        }
+    if let Err(e) = rules.replace(p.rules.clone()) {
+        tracing::warn!("ignoring invalid persisted rules: {e}");
     }
     intercept.set_scope(p.scope.clone());
     scanner.set_enabled(p.scanner_enabled);
@@ -83,17 +157,96 @@ pub fn snapshot(
     }
 }
 
-/// Best-effort save (creates the parent dir). Never fails an API call.
-pub fn save(path: &Path, p: &Persisted) {
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn save_local(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        crate::paths::secure_dir(dir)?;
     }
-    match serde_json::to_vec_pretty(p) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(path, bytes) {
-                tracing::warn!("could not save config {}: {e}", path.display());
-            }
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}-{seq}",
+        std::process::id(),
+        snare_core::now_millis()
+    ));
+    write_private(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    secure_file(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Persisted {
+        Persisted {
+            rules: vec![],
+            scope: vec!["example.test".into()],
+            scanner_enabled: true,
+            vars: vec![("token".into(), "secret".into())],
+            macros: vec![],
         }
-        Err(e) => tracing::warn!("could not serialize config: {e}"),
+    }
+
+    #[test]
+    fn local_backend_round_trips_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "snare-config-test-{}-{}",
+            std::process::id(),
+            snare_core::now_millis()
+        ));
+        let path = root.join("config.json");
+        let backend = Backend::Local(path.clone());
+        backend.save(&sample());
+        let loaded = backend.load().unwrap();
+        assert_eq!(loaded.scope, vec!["example.test"]);
+        assert_eq!(loaded.vars[0].1, "secret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(root);
     }
 }

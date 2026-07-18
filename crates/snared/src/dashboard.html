@@ -277,6 +277,7 @@
   <span class="logo">🪤 Snare <small>· Live</small></span>
   <span class="stat"><b id="count">0</b> flows</span>
   <span class="ops" id="ops" title="operators online"></span>
+  <button id="btnLogout" style="display:none" title="End this team session">Logout</button>
   <span class="grow"></span>
   <input type="text" id="filter" placeholder="filter — e.g. status:4 host:api !mime:json" autocomplete="off" title="HTTPQL: field:value (status/host/path/method/mime/source), ! negates, space = AND">
   <input type="text" id="scope" class="scope" placeholder="scope: host,host…" title="Limit intercept to these hosts (comma-separated; empty = all)" autocomplete="off">
@@ -504,7 +505,9 @@
                   auto: true, notify: false, query: [], intercept: false, interceptResp: false, held: [], findings: [], ws: [] };
 
   // ---------- helpers ----------
-  const esc = s => (s==null?'':String(s)).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
   const hhmmss = ts => { const d=new Date(ts); const p=n=>String(n).padStart(2,'0');
     return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds()); };
   const sizeFmt = n => n==null?'':(n<1024?n+'B':n<1048576?(n/1024).toFixed(1)+'K':(n/1048576).toFixed(1)+'M');
@@ -627,7 +630,8 @@
     if(state.tab==='req'){
       const rq=f.request;
       const line = `${rq.method} ${rq.path}${rq.query?('?'+rq.query):''} ${rq.http_version}`;
-      let html = esc(line)+'\n'+headerBlock(rq.headers)+'\n\n'+esc(b64dec(rq.body));
+      let html = (rq.body_truncated ? '<span class="s4">[body capture truncated; wire traffic was complete]</span>\n' : '')+
+        esc(line)+'\n'+headerBlock(rq.headers)+'\n\n'+esc(b64dec(rq.body));
       const gql = detectGraphQL(rq);
       if(gql){
         html = `<span class="gql">╭─ GraphQL${gql.op?(' · '+esc(gql.op)):''} ─╮</span>\n`+
@@ -640,7 +644,8 @@
       const rs=f.response;
       if(!rs){ $('dBody').innerHTML='<span class="kv">no response captured</span>'; return; }
       const line = `${rs.http_version} ${rs.status}`;
-      $('dBody').innerHTML = esc(line)+'\n'+headerBlock(rs.headers)+'\n\n'+esc(b64dec(rs.body));
+      $('dBody').innerHTML = (rs.body_truncated ? '<span class="s4">[body capture truncated; wire traffic was complete]</span>\n' : '')+
+        esc(line)+'\n'+headerBlock(rs.headers)+'\n\n'+esc(b64dec(rs.body));
     }
   }
 
@@ -852,7 +857,8 @@
   // ---------- Intruder ----------
   function flowUrl(r, path, query){
     const defp = (r.scheme==='https'&&r.port===443)||(r.scheme==='http'&&r.port===80);
-    const auth = defp ? r.host : `${r.host}:${r.port}`;
+    const host = r.host.includes(':') && !r.host.startsWith('[') ? `[${r.host}]` : r.host;
+    const auth = defp ? host : `${host}:${r.port}`;
     return `${r.scheme}://${auth}${path}${query?('?'+query):''}`;
   }
   function openIntruder(){
@@ -1168,6 +1174,7 @@
 
   // ---------- Boot (auth-gated) ----------
   function start(){
+    $('btnLogout').style.display = authToken ? '' : 'none';
     initial(); connect();
     if(authToken){ loadOperators(); setInterval(loadOperators, 15000); } // team mode
   }
@@ -1186,6 +1193,10 @@
   }
   $('lbtn').onclick = doLogin;
   $('lname').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+  $('btnLogout').onclick = async () => {
+    try{ await fetch('/api/v1/team/logout',{method:'POST'}); }catch(e){}
+    authToken = null; localStorage.removeItem('snare_token'); location.reload();
+  };
   async function boot(){
     let who;
     try{ who = await (await _fetch('/api/v1/team/whoami', authToken?{headers:{'Authorization':'Bearer '+authToken}}:{})).json(); }

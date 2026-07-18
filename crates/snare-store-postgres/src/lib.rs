@@ -33,16 +33,25 @@ const SCHEMA: &str = r#"
         http_version  TEXT    NOT NULL,
         req_headers   TEXT    NOT NULL,
         req_body      BYTEA   NOT NULL,
+        req_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
         status        INTEGER,
         resp_version  TEXT,
         resp_headers  TEXT,
         resp_body     BYTEA,
+        resp_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
         mime          TEXT,
         resp_size     BIGINT,
         duration_ms   BIGINT
     );
     CREATE INDEX IF NOT EXISTS idx_flows_ts   ON flows(ts);
     CREATE INDEX IF NOT EXISTS idx_flows_host ON flows(host);
+    ALTER TABLE flows ADD COLUMN IF NOT EXISTS req_body_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE flows ADD COLUMN IF NOT EXISTS resp_body_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE TABLE IF NOT EXISTS snare_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at BIGINT NOT NULL
+    );
 "#;
 
 /// Run the schema DDL guarded by an advisory lock so concurrent daemons don't
@@ -92,7 +101,9 @@ impl PostgresStore {
             })
             .map_err(|e| anyhow!("spawn pg actor: {e}"))?;
 
-        ready_rx.recv().map_err(|_| anyhow!("pg actor died on startup"))??;
+        ready_rx
+            .recv()
+            .map_err(|_| anyhow!("pg actor died on startup"))??;
         Ok(Self { tx: job_tx })
     }
 
@@ -109,6 +120,70 @@ impl PostgresStore {
             }))
             .map_err(|_| anyhow!("pg actor gone"))?;
         rx.recv().map_err(|_| anyhow!("pg actor dropped the job"))?
+    }
+
+    pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_string();
+        self.exec(move |c| {
+            Ok(
+                c.query_opt("SELECT value FROM snare_settings WHERE key=$1", &[&key])?
+                    .map(|row| row.get(0)),
+            )
+        })
+    }
+
+    pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.to_string();
+        let value = value.to_string();
+        let updated_at = snare_core::now_millis();
+        self.exec(move |c| {
+            c.execute(
+                "INSERT INTO snare_settings(key,value,updated_at) VALUES($1,$2,$3) \
+                 ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
+                &[&key, &value, &updated_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Update one top-level field of a JSON setting under a row lock. This
+    /// prevents unrelated config changes from separate daemons overwriting one
+    /// another with stale snapshots.
+    pub fn save_setting_field(&self, key: &str, field: &str, value: &str) -> Result<()> {
+        let key = key.to_string();
+        let field = field.to_string();
+        let value: serde_json::Value = serde_json::from_str(value)?;
+        let updated_at = snare_core::now_millis();
+        self.exec(move |c| {
+            let mut tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO snare_settings(key,value,updated_at) VALUES($1,'{}',$2) \
+                 ON CONFLICT(key) DO NOTHING",
+                &[&key, &updated_at],
+            )?;
+            let current = tx
+                .query_opt(
+                    "SELECT value FROM snare_settings WHERE key=$1 FOR UPDATE",
+                    &[&key],
+                )?
+                .map(|row| row.get::<_, String>(0));
+            let mut document: serde_json::Value = current
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let object = document
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("shared config is not a JSON object"))?;
+            object.insert(field, value);
+            let serialized = serde_json::to_string(&document)?;
+            tx.execute(
+                "INSERT INTO snare_settings(key,value,updated_at) VALUES($1,$2,$3) \
+                 ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
+                &[&key, &serialized, &updated_at],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 }
 
@@ -139,12 +214,22 @@ impl FlowStore for PostgresStore {
             let row = c.query_one(
                 r#"INSERT INTO flows
                     (ts, source, scheme, method, host, port, path, query,
-                     http_version, req_headers, req_body)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                     http_version, req_headers, req_body, req_body_truncated)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                    RETURNING id"#,
                 &[
-                    &ts, &src, &req.scheme, &req.method, &req.host, &port, &req.path,
-                    &req.query, &req.http_version, &headers, &req.body,
+                    &ts,
+                    &src,
+                    &req.scheme,
+                    &req.method,
+                    &req.host,
+                    &port,
+                    &req.path,
+                    &req.query,
+                    &req.http_version,
+                    &headers,
+                    &req.body,
+                    &req.body_truncated,
                 ],
             )?;
             Ok(row.get::<_, i64>(0))
@@ -162,9 +247,19 @@ impl FlowStore for PostgresStore {
             c.execute(
                 r#"UPDATE flows SET
                     status=$2, resp_version=$3, resp_headers=$4, resp_body=$5,
-                    mime=$6, resp_size=$7, duration_ms=$8
+                    resp_body_truncated=$6, mime=$7, resp_size=$8, duration_ms=$9
                    WHERE id=$1"#,
-                &[&id, &status, &resp.http_version, &headers, &resp.body, &mime, &size, &dur],
+                &[
+                    &id,
+                    &status,
+                    &resp.http_version,
+                    &headers,
+                    &resp.body,
+                    &resp.body_truncated,
+                    &mime,
+                    &size,
+                    &dur,
+                ],
             )?;
             Ok(())
         })
@@ -194,7 +289,7 @@ impl FlowStore for PostgresStore {
                 sql.push_str(" WHERE ");
                 sql.push_str(&where_parts.join(" AND "));
             }
-            let limit = q.limit.max(1);
+            let limit = q.limit.clamp(1, 1_000);
             let offset = q.offset.max(0);
             sql.push_str(&format!(
                 " ORDER BY id DESC LIMIT ${} OFFSET ${}",
@@ -234,8 +329,9 @@ impl FlowStore for PostgresStore {
         self.exec(move |c| {
             let Some(r) = c.query_opt(
                 r#"SELECT id, ts, source, scheme, method, host, port, path, query,
-                          http_version, req_headers, req_body,
-                          status, resp_version, resp_headers, resp_body, duration_ms
+                          http_version, req_headers, req_body, req_body_truncated,
+                          status, resp_version, resp_headers, resp_body,
+                          resp_body_truncated, duration_ms
                    FROM flows WHERE id=$1"#,
                 &[&id],
             )?
@@ -252,13 +348,15 @@ impl FlowStore for PostgresStore {
                 http_version: r.get(9),
                 headers: headers_from_json(r.get::<_, &str>(10)),
                 body: r.get(11),
+                body_truncated: r.get(12),
             };
-            let status: Option<i32> = r.get(12);
+            let status: Option<i32> = r.get(13);
             let response = status.map(|status| HttpResponse {
                 status: status as u16,
-                http_version: r.get::<_, Option<String>>(13).unwrap_or_default(),
-                headers: headers_from_json(&r.get::<_, Option<String>>(14).unwrap_or_default()),
-                body: r.get::<_, Option<Vec<u8>>>(15).unwrap_or_default(),
+                http_version: r.get::<_, Option<String>>(14).unwrap_or_default(),
+                headers: headers_from_json(&r.get::<_, Option<String>>(15).unwrap_or_default()),
+                body: r.get::<_, Option<Vec<u8>>>(16).unwrap_or_default(),
+                body_truncated: r.get(17),
             });
             Ok(Some(Flow {
                 id: r.get(0),
@@ -266,7 +364,7 @@ impl FlowStore for PostgresStore {
                 source: source_from_str(r.get::<_, &str>(2)),
                 request,
                 response,
-                duration_ms: r.get::<_, Option<i64>>(16).map(|v| v as u64),
+                duration_ms: r.get::<_, Option<i64>>(18).map(|v| v as u64),
             }))
         })
     }

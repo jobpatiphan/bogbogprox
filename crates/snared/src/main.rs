@@ -17,13 +17,17 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use snare_core::store::{FlowQuery, FlowStore};
-use snare_engine::{generate_ca, EngineConfig};
+use snare_engine::{generate_ca, EngineConfig, EngineServices};
 use snare_store_sqlite::SqliteStore;
 
 use crate::paths::Paths;
 
 #[derive(Parser)]
-#[command(name = "snared", version, about = "Snare daemon — Rust-native web security proxy")]
+#[command(
+    name = "snared",
+    version,
+    about = "Snare daemon — Rust-native web security proxy"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -53,6 +57,16 @@ enum Cmd {
         /// local mode, no auth.
         #[arg(long)]
         auth_token: Option<String>,
+    },
+    /// Launch an isolated browser profile with proxying and test-only certificate
+    /// error bypass — similar to Burp's embedded browser.
+    Browser {
+        /// Proxy to route the browser through.
+        #[arg(long, default_value = "127.0.0.1:8888")]
+        proxy: SocketAddr,
+        /// Start URL.
+        #[arg(long, default_value = "about:blank")]
+        url: String,
     },
     /// List captured flows.
     Flows {
@@ -89,24 +103,33 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Ca { action } => cmd_ca(&paths, action),
-        Cmd::Run { proxy, api, postgres, auth_token } => {
+        Cmd::Run {
+            proxy,
+            api,
+            postgres,
+            auth_token,
+        } => {
+            let postgres = postgres.or_else(|| std::env::var("SNARE_POSTGRES").ok());
+            let auth_token = auth_token.or_else(|| std::env::var("SNARE_AUTH_TOKEN").ok());
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cmd_run(&paths, proxy, api, postgres, auth_token))
         }
+        Cmd::Browser { proxy, url } => cmd_browser(proxy, &url),
         Cmd::Flows { search, limit } => cmd_flows(&paths, search, limit),
         Cmd::Flush => cmd_flush(&paths),
     }
 }
 
 fn open_store(paths: &Paths) -> Result<SqliteStore> {
-    std::fs::create_dir_all(&paths.data_dir).context("create data dir")?;
+    paths::secure_dir(&paths.data_dir).context("create data dir")?;
     SqliteStore::open(paths.db())
 }
 
 fn cmd_ca(paths: &Paths, action: CaCmd) -> Result<()> {
     match action {
         CaCmd::Generate { force } => {
-            std::fs::create_dir_all(paths.ca_dir()).context("create ca dir")?;
+            paths::secure_dir(&paths.config_dir).context("create config dir")?;
+            paths::secure_dir(&paths.ca_dir()).context("create ca dir")?;
             if paths.ca_key().exists() && !force {
                 println!(
                     "CA already exists at {}\n(use `snared ca generate --force` to replace)",
@@ -156,28 +179,29 @@ async fn cmd_run(
     let ca_cert_pem = std::fs::read_to_string(paths.ca_cert())?;
     let ca_key_pem = std::fs::read_to_string(paths.ca_key())?;
 
-    // Team mode: shared Postgres store; otherwise local SQLite.
-    let store_dyn: Arc<dyn FlowStore> = match &postgres {
+    paths::secure_dir(&paths.config_dir).context("secure config dir")?;
+    paths::secure_dir(&paths.data_dir).context("secure data dir")?;
+    let local_config_path = paths.config_file();
+
+    // Team mode: shared Postgres flows + config; otherwise local files.
+    let (store_dyn, config_backend): (Arc<dyn FlowStore>, config::Backend) = match &postgres {
         Some(url) => {
             let pg = snare_store_postgres::PostgresStore::connect(url)
                 .context("connect Postgres (team mode)")?;
             tracing::info!("store: Postgres (team mode)");
-            Arc::new(pg)
+            (Arc::new(pg.clone()), config::Backend::Postgres(pg))
         }
         None => {
             tracing::info!("store: SQLite (local)");
-            Arc::new(open_store(paths)?)
+            (
+                Arc::new(open_store(paths)?),
+                config::Backend::Local(local_config_path.clone()),
+            )
         }
     };
     let (events, _rx) = tokio::sync::broadcast::channel(1024);
     // Cross-process events from other daemons (topology B); merged into SSE.
     let (remote_events, _rrx) = tokio::sync::broadcast::channel(1024);
-    // Relay the local event bus through Postgres so several proxies share live
-    // events. (Central single-daemon mode doesn't need it but it's harmless.)
-    if let Some(url) = &postgres {
-        pubsub::start(url.clone(), events.clone(), remote_events.clone());
-        tracing::info!("cross-process events: Postgres LISTEN/NOTIFY");
-    }
     let intercept = Arc::new(snare_core::intercept::Intercept::new());
     let rules = Arc::new(snare_core::rules::Rules::new());
     let scanner = Arc::new(snare_core::scanner::Scanner::new());
@@ -186,10 +210,56 @@ async fn cmd_run(
     let session_macros = Arc::new(snare_core::session::Macros::new());
 
     // Restore persisted state (rules / scope / scanner / vars / macros).
-    let config_path = paths.config_file();
-    if let Some(persisted) = config::load(&config_path) {
-        config::apply(&persisted, &rules, &intercept, &scanner, &vars, &session_macros);
-        tracing::info!("restored {} rule(s) from {}", persisted.rules.len(), config_path.display());
+    if let Some(persisted) = config_backend.load() {
+        config::apply(
+            &persisted,
+            &rules,
+            &intercept,
+            &scanner,
+            &vars,
+            &session_macros,
+        );
+        tracing::info!("restored {} persisted rule(s)", persisted.rules.len());
+    }
+
+    // Relay events across daemons and apply shared state locally when another
+    // operator mutates it.
+    if let Some(url) = &postgres {
+        pubsub::start(url.clone(), events.clone(), remote_events.clone());
+        let mut remote_rx = remote_events.subscribe();
+        let shared_config = config_backend.clone();
+        let shared_rules = rules.clone();
+        let shared_intercept = intercept.clone();
+        let shared_scanner = scanner.clone();
+        let shared_vars = vars.clone();
+        let shared_macros = session_macros.clone();
+        let shared_wslog = wslog.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = remote_rx.recv().await {
+                match event {
+                    snare_core::model::FlowEvent::ConfigChanged { .. } => {
+                        if let Some(persisted) = shared_config.load() {
+                            config::apply(
+                                &persisted,
+                                &shared_rules,
+                                &shared_intercept,
+                                &shared_scanner,
+                                &shared_vars,
+                                &shared_macros,
+                            );
+                        }
+                    }
+                    snare_core::model::FlowEvent::Finding { finding } => {
+                        shared_scanner.ingest(finding);
+                    }
+                    snare_core::model::FlowEvent::WsMessage { msg } => {
+                        shared_wslog.ingest(msg);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        tracing::info!("cross-process events/config: Postgres LISTEN/NOTIFY");
     }
 
     let auth_enabled = auth_token.is_some();
@@ -207,18 +277,21 @@ async fn cmd_run(
         macros: session_macros.clone(),
         auth: Arc::new(auth::Auth::new(auth_token)),
         remote_events: remote_events.clone(),
-        config_path: config_path.clone(),
+        config: config_backend,
     });
     let listener = tokio::net::TcpListener::bind(api_addr)
         .await
         .with_context(|| format!("bind API {api_addr}"))?;
     tracing::info!("REST API on http://{api_addr}");
     let api_task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        if let Err(error) = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
-            .await;
+            .await
+        {
+            tracing::error!(%error, "REST API stopped unexpectedly");
+        }
     });
 
     // Proxy engine
@@ -237,13 +310,93 @@ async fn cmd_run(
     }
     println!("  press Ctrl-C to stop");
 
-    snare_engine::run(cfg, store_dyn, events, intercept, rules, scanner, vars, wslog, async {
+    let services = EngineServices {
+        store: store_dyn,
+        events,
+        intercept,
+        rules,
+        scanner,
+        vars,
+        wslog,
+    };
+    snare_engine::run(cfg, services, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await?;
 
     api_task.abort();
     Ok(())
+}
+
+/// Launch a Chromium-family browser pre-wired to the proxy, in a throwaway
+/// profile, ignoring cert errors (so the MITM'd HTTPS just works) — the
+/// convenience "embedded browser" you point at your target.
+fn cmd_browser(proxy: SocketAddr, url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[&str] = &["chrome.exe", "msedge.exe", "brave.exe", "chromium.exe"];
+    #[cfg(not(target_os = "windows"))]
+    const CANDIDATES: &[&str] = &[
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "brave-browser",
+    ];
+    let mut random = [0u8; 8];
+    getrandom::getrandom(&mut random)
+        .map_err(|e| anyhow::anyhow!("create private browser profile name: {e}"))?;
+    let suffix = u64::from_le_bytes(random);
+    let profile = std::env::temp_dir().join(format!(
+        "snare-browser-{}-{suffix:016x}",
+        std::process::id()
+    ));
+    paths::secure_dir(&profile).context("create throwaway browser profile")?;
+    struct ProfileGuard(std::path::PathBuf);
+    impl Drop for ProfileGuard {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "warning: could not remove browser profile {}: {e}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+    let _profile_guard = ProfileGuard(profile.clone());
+
+    let mut failures = Vec::new();
+    for browser in CANDIDATES {
+        let child = std::process::Command::new(browser)
+            .arg(format!("--proxy-server=http://{proxy}"))
+            .arg("--proxy-bypass-list=<-loopback>")
+            .arg("--ignore-certificate-errors")
+            .arg("--disable-background-mode")
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg(url)
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                println!("Launching {browser} → proxy {proxy}");
+                println!("  temporary profile: {}", profile.display());
+                println!("  close the browser to return and remove the temporary profile");
+                let status = child
+                    .wait()
+                    .with_context(|| format!("wait for {browser}"))?;
+                if !status.success() {
+                    bail!("{browser} exited with {status}");
+                }
+                return Ok(());
+            }
+            Err(e) => failures.push(format!("{browser}: {e}")),
+        }
+    }
+    bail!(
+        "no Chromium-family browser could be launched (tried {}). Details: {}",
+        CANDIDATES.join(", "),
+        failures.join("; ")
+    )
 }
 
 fn cmd_flows(paths: &Paths, search: Option<String>, limit: i64) -> Result<()> {
@@ -260,7 +413,10 @@ fn cmd_flows(paths: &Paths, search: Option<String>, limit: i64) -> Result<()> {
         return Ok(());
     }
     for f in flows {
-        let status = f.status.map(|s| s.to_string()).unwrap_or_else(|| "…".into());
+        let status = f
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "…".into());
         println!(
             "#{:<5} {:>3} {:<6} {}://{}{}",
             f.id, status, f.method, f.scheme, f.host, f.path
