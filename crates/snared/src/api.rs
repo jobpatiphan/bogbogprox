@@ -28,7 +28,7 @@ use snare_core::store::{FlowQuery, FlowStore};
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 
-use crate::{intruder, repeater};
+use crate::{active_scan, intruder, repeater};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -83,6 +83,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/rules/:id/toggle", post(rules_toggle))
         .route("/api/v1/intruder", post(intruder_run))
         .route("/api/v1/findings", get(findings_list).post(scanner_toggle))
+        .route("/api/v1/scan/active", post(active_scan_run))
         .with_state(state)
 }
 
@@ -467,6 +468,21 @@ async fn scanner_toggle(State(st): State<AppState>, Json(b): Json<ScannerToggle>
     }
     st.persist();
     Json(json!({ "on": st.scanner.enabled() })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActiveScanBody {
+    pub from_flow: i64,
+}
+
+/// Active-scan a captured flow's query parameters (XSS / SQLi probes).
+async fn active_scan_run(State(st): State<AppState>, Json(b): Json<ActiveScanBody>) -> Response {
+    let base = match intruder::base_from_flow(&st.store, b.from_flow) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() }))).into_response(),
+    };
+    let results = active_scan::scan(&st.store, &st.events, &st.scanner, &base).await;
+    Json(json!({ "results": results })).into_response()
 }
 
 fn err(e: anyhow::Error) -> Response {

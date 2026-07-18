@@ -1,5 +1,6 @@
 //! `snared` — the Snare daemon: proxy engine + REST API + project store.
 
+mod active_scan;
 mod api;
 mod config;
 mod intruder;

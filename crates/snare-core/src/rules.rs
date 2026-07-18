@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Header, HttpRequest, HttpResponse};
 
+/// Skip body-level regex on bodies larger than this (avoid pathological CPU on
+/// big downloads). Header/URL rules still apply.
+const MAX_BODY_SCAN: usize = 2 * 1024 * 1024;
+
 /// Which part of a message a rule targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,7 +127,7 @@ impl Rules {
                         changed = true;
                     }
                 }
-                Part::RequestBody => {
+                Part::RequestBody if req.body.len() <= MAX_BODY_SCAN => {
                     let body = String::from_utf8_lossy(&req.body).into_owned();
                     if let Cow::Owned(s) = c.re.replace_all(&body, c.spec.replace.as_str()) {
                         req.body = s.into_bytes();
@@ -147,7 +151,7 @@ impl Rules {
         let mut changed = false;
         for c in g.iter().filter(|c| c.spec.enabled) {
             match c.spec.part {
-                Part::ResponseBody => {
+                Part::ResponseBody if resp.body.len() <= MAX_BODY_SCAN => {
                     let body = String::from_utf8_lossy(&resp.body).into_owned();
                     if let Cow::Owned(s) = c.re.replace_all(&body, c.spec.replace.as_str()) {
                         resp.body = s.into_bytes();

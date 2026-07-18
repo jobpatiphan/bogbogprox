@@ -411,11 +411,13 @@
       $('dHead').innerHTML = `<button id="resend" title="Resend as-is (Repeater)">↻ Resend</button>`+
         `<button id="editrep" title="Edit &amp; send (Repeater)">✎ Edit</button>`+
         `<button id="tointruder" title="Send to Intruder (fuzz)">⚔ Intruder</button>`+
+        `<button id="activescan" title="Active scan query params (XSS/SQLi)">🛡 Scan</button>`+
         `<span class="m m-${esc(f.request.method)}">${esc(f.request.method)}</span> `+
         `<span class="url">${esc(url)}</span>`;
       $('resend').onclick = () => resend(id);
       $('editrep').onclick = () => openRepeater();
       $('tointruder').onclick = () => openIntruder();
+      $('activescan').onclick = () => activeScan(id);
       renderDetail();
     }catch(e){ $('dHead').innerHTML='<span class="s5">failed to load</span>'; }
   }
@@ -653,6 +655,19 @@
   function runDecoder(op){
     try{ $('decOut').value = dec[op]($('decIn').value); }
     catch(e){ $('decOut').value = 'error: '+e.message; }
+  }
+
+  // ---------- Active scan ----------
+  async function activeScan(id){
+    const btn = $('activescan'); if(btn){ btn.disabled = true; btn.textContent = '🛡 scanning…'; }
+    try{
+      const r = await (await fetch('/api/v1/scan/active',{method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({from_flow:id})})).json();
+      const hits = (r.results||[]).filter(x => x.hit).length;
+      $('findings').classList.add('show'); loadFindings();
+      if(btn){ btn.textContent = hits ? `🛡 ${hits} hit${hits>1?'s':''}` : '🛡 clean'; }
+    }catch(e){ if(btn) btn.textContent = '🛡 error'; }
+    if(btn) setTimeout(()=>{ btn.disabled=false; btn.textContent='🛡 Scan'; }, 2500);
   }
 
   // ---------- Findings (passive scan) ----------

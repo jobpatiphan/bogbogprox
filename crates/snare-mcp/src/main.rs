@@ -210,6 +210,15 @@ fn tool_specs() -> Value {
                 },
                 "required": ["from_flow", "payloads"]
             }
+        },
+        {
+            "name": "active_scan",
+            "description": "Active-scan a captured flow's query parameters for reflected-XSS and error-based SQLi. Returns per-probe results; findings appear in the dashboard. Needs a running `snared`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "from_flow": { "type": "integer", "description": "flow id to scan" } },
+                "required": ["from_flow"]
+            }
         }
     ])
 }
@@ -275,6 +284,10 @@ fn summarize_call(name: &str, args: &Value) -> String {
             let id = args.get("id").or_else(|| args.get("from_flow")).and_then(|i| i.as_i64()).unwrap_or(-1);
             let n = args.get("payloads").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
             format!("intruder: fuzz flow #{id} with {n} payloads")
+        }
+        "active_scan" => {
+            let id = args.get("from_flow").and_then(|i| i.as_i64()).unwrap_or(-1);
+            format!("active-scan flow #{id} (XSS/SQLi)")
         }
         other => format!("call {other}"),
     }
@@ -373,6 +386,17 @@ fn tools_call(params: Option<&Value>, store: &SqliteStore) -> Result<Value> {
             .to_string();
             let out = post_read_body(&host, port, "/api/v1/intruder", &body, 60_000)
                 .map_err(|e| anyhow::anyhow!("intruder failed (is `snared run` up?): {e}"))?;
+            Ok(text_result(out))
+        }
+        "active_scan" => {
+            let from_flow = args
+                .get("from_flow")
+                .and_then(|i| i.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("missing `from_flow`"))?;
+            let (host, port) = api_host_port();
+            let body = json!({ "from_flow": from_flow }).to_string();
+            let out = post_read_body(&host, port, "/api/v1/scan/active", &body, 60_000)
+                .map_err(|e| anyhow::anyhow!("active scan failed (is `snared run` up?): {e}"))?;
             Ok(text_result(out))
         }
         other => anyhow::bail!("unknown tool: {other}"),

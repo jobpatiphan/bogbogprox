@@ -70,6 +70,15 @@ impl Scanner {
         self.seen.lock().unwrap().clear();
     }
 
+    /// Record a finding discovered elsewhere (e.g. the active scanner). Not
+    /// de-duped — active findings are per-probe and meant to be seen.
+    pub fn record(&self, flow_id: i64, severity: Severity, title: String, detail: String, host: String) -> Finding {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let f = Finding { id, flow_id, severity, title, detail, host };
+        self.findings.lock().unwrap().push(f.clone());
+        f
+    }
+
     /// Inspect a completed flow and return any *new* findings (also stored).
     pub fn scan(&self, flow: &Flow) -> Vec<Finding> {
         if !self.enabled() {
