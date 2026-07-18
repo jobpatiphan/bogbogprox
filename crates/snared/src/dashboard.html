@@ -142,6 +142,19 @@
   #decoder textarea{margin:10px 14px;height:22vh;background:#0a0e14;color:#e6edf3;border:1px solid var(--line);
     border-radius:6px;padding:10px;font-family:var(--mono);font-size:12px;resize:none;outline:none}
   #decoder textarea:last-child{margin-top:0}
+  /* Comparer */
+  #comparer{position:fixed;inset:0;background:rgba(2,4,8,.72);display:none;align-items:center;justify-content:center;z-index:20}
+  #comparer.show{display:flex}
+  #comparer .cbox{width:min(1000px,96vw);max-height:88vh;background:var(--panel);border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column;overflow:hidden}
+  #comparer .rhead{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);font-weight:700}
+  #comparer .rhead .grow{flex:1} #comparer .rhead .ihint{color:var(--dim);font-weight:400;font-size:12px}
+  #comparer .rhead .cstat{color:var(--accent2);font-family:var(--mono);font-size:12px}
+  #comparer .rhead button{background:var(--accent);color:#000;border:0;padding:5px 14px;border-radius:6px;cursor:pointer;font-weight:700}
+  #comparer .rhead span[id]{cursor:pointer;color:var(--dim)}
+  #comparer .ccols,#comparer .cresult{display:flex;gap:0;padding:0;overflow:auto}
+  #comparer textarea,#comparer .cpane{flex:1;height:64vh;background:#0a0e14;color:#e6edf3;border:1px solid var(--line);padding:10px;font-family:var(--mono);font-size:12px;resize:none;outline:none;white-space:pre;overflow:auto;margin:0}
+  #comparer .cpane .diff{background:#3a1d1d;display:block}
+  #comparer .cpane .same{display:block;opacity:.65}
   /* Repeater + Intruder share modal styling */
   #repeater{position:fixed;inset:0;background:rgba(2,4,8,.72);display:none;align-items:center;justify-content:center;z-index:20}
   #repeater.show{display:flex}
@@ -200,6 +213,7 @@
   <button id="btnInterceptResp" title="Also hold responses">⏸ Resp: off</button>
   <button id="btnRules" title="Match &amp; Replace rules">⚙ M&amp;R</button>
   <button id="btnFindings" title="Passive scan findings">⚠ Findings <b id="findCount"></b></button>
+  <button id="btnCompare" title="Compare two requests/responses">⚖ Compare</button>
   <button id="btnDecoder" title="Encode / decode">🔧 Decoder</button>
   <button id="btnNotify" title="Desktop popups when the AI acts">🔔 Popups: off</button>
   <button id="btnAuto" class="active" title="Auto-scroll to newest">⤓ Auto</button>
@@ -262,6 +276,18 @@
       <textarea id="ipayloads" spellcheck="false" placeholder="payloads — one per line"></textarea>
     </div>
     <div class="iresults" id="iresults"></div>
+  </div>
+</div>
+
+<div id="comparer">
+  <div class="cbox">
+    <div class="rhead">⚖ Comparer <span class="ihint">paste or send two items, then Compare (differing lines highlight)</span>
+      <span class="grow"></span><span id="cdiff" class="cstat"></span><button id="cbtn">Compare</button><span id="compClose">✕</span></div>
+    <div class="ccols" id="cedit">
+      <textarea id="ca" spellcheck="false" placeholder="A"></textarea>
+      <textarea id="cb" spellcheck="false" placeholder="B"></textarea>
+    </div>
+    <div class="cresult" id="cresult" style="display:none"></div>
   </div>
 </div>
 
@@ -641,6 +667,32 @@
     $('iresults').innerHTML = html + '</tbody></table>';
   }
 
+  // ---------- Comparer ----------
+  function runCompare(){
+    const a = $('ca').value.split('\n'), b = $('cb').value.split('\n');
+    const n = Math.max(a.length, b.length);
+    let diffCount = 0;
+    const paneA = document.createElement('div'), paneB = document.createElement('div');
+    paneA.className = 'cpane'; paneB.className = 'cpane';
+    for(let i=0;i<n;i++){
+      const la = a[i], lb = b[i], differ = la !== lb;
+      if(differ) diffCount++;
+      const cls = differ ? 'diff' : 'same';
+      paneA.innerHTML += `<span class="${cls}">${esc(la===undefined?'':la)||' '}</span>`;
+      paneB.innerHTML += `<span class="${cls}">${esc(lb===undefined?'':lb)||' '}</span>`;
+    }
+    const res = $('cresult'); res.innerHTML = ''; res.appendChild(paneA); res.appendChild(paneB);
+    $('cedit').style.display = 'none'; res.style.display = 'flex';
+    $('cbtn').textContent = 'Edit';
+    $('cdiff').textContent = `${diffCount} line${diffCount!==1?'s':''} differ · Δlen ${$('cb').value.length - $('ca').value.length}`;
+  }
+  function toggleCompare(){
+    if($('cresult').style.display !== 'none'){
+      $('cresult').style.display = 'none'; $('cedit').style.display = 'flex';
+      $('cbtn').textContent = 'Compare'; $('cdiff').textContent = '';
+    } else runCompare();
+  }
+
   // ---------- Decoder ----------
   const dec = {
     b64e: s => btoa(unescape(encodeURIComponent(s))),
@@ -769,6 +821,9 @@
   $('rpreq').addEventListener('keydown', e => { if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); rpSend(); }});
   $('irun').onclick = runIntruder;
   $('intruderClose').onclick = () => $('intruder').classList.remove('show');
+  $('btnCompare').onclick = () => $('comparer').classList.add('show');
+  $('compClose').onclick = () => $('comparer').classList.remove('show');
+  $('cbtn').onclick = toggleCompare;
   $('btnDecoder').onclick = () => $('decoder').classList.add('show');
   $('decClose').onclick = () => $('decoder').classList.remove('show');
   document.querySelectorAll('#decoder .dbtns button').forEach(b => b.onclick = () => runDecoder(b.dataset.op));
