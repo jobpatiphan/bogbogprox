@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img alt="status" src="https://img.shields.io/badge/status-design%20%2F%20planning-blue">
+  <img alt="status" src="https://img.shields.io/badge/status-alpha%20%C2%B7%20core%20working-brightgreen">
   <img alt="language" src="https://img.shields.io/badge/built%20with-Rust-orange?logo=rust">
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-green">
   <img alt="AI" src="https://img.shields.io/badge/AI--native-MCP-8A2BE2">
@@ -63,11 +63,30 @@ See the full **57-section architecture** in **[`docs/DESIGN.md`](docs/DESIGN.md)
 
 ## Status
 
-🟢 **Phase 1 core loop working** — a real, runnable vertical slice: the proxy
-intercepts and decrypts HTTPS, captures every request/response into SQLite, and
-exposes them over a REST API, an MCP server (so Claude can query flows), and a
-TUI. The full [`docs/DESIGN.md`](docs/DESIGN.md) (57 sections) covers the rest of
-the road: scanner, AI agent, threat model, 20 ADRs, and moonshots.
+🟢 **Working today** — the Burp-style core is implemented, runnable, and
+verified end-to-end:
+
+| Capability | State |
+|---|---|
+| HTTPS-intercepting proxy + capture (SQLite) | ✅ |
+| **Interactive Intercept** — hold/edit/drop requests *and* responses | ✅ |
+| **Scope** — limit intercept to given hosts | ✅ |
+| **Repeater** — resend a captured request | ✅ |
+| **Match & Replace** — automatic regex rewrites on req/resp | ✅ |
+| **Intruder** — bounded-parallel payload fuzzing | ✅ |
+| **Passive scanner** — auto-flag missing headers, cookie flags, reflected params | ✅ |
+| **Decoder** — Base64 / URL / Hex / JWT | ✅ |
+| Three faces — TUI · Web dashboard · Desktop (Tauri) | ✅ |
+| AI-native — MCP tools (`proxy_*`, `repeater_send`, `intruder_run`) | ✅ |
+| Persisted rules / scope / scanner across restart | ✅ |
+
+Still on the roadmap (see [`docs/DESIGN.md`](docs/DESIGN.md), 57 sections):
+HTTPQL query language, active scanner, Comparer/Sequencer, WebSocket/GraphQL,
+session handling & macros, reporting (SARIF), team mode, WASM plugins, and the
+autonomous AI pentester.
+
+The live dashboard (`http://127.0.0.1:9000/`) exposes intercept, scope, Match &
+Replace, findings, and the decoder from its toolbar.
 
 ### Quickstart
 
@@ -99,8 +118,9 @@ Three faces, one core — the same live dashboard, natively:
 > The other crates build without them.
 
 The `snare-mcp` binary is a stdio MCP server exposing `proxy_list_flows`,
-`proxy_get_flow`, `proxy_stats`, and `repeater_send` — point an MCP client (e.g.
-Claude) at it to drive the captured traffic. It reports each call to the daemon,
+`proxy_get_flow`, `proxy_stats`, `repeater_send`, and `intruder_run` — point an
+MCP client (e.g. Claude) at it to drive the captured traffic. It reports each
+call to the daemon,
 so the dashboard shows, live, what the agent is doing.
 
 ### Roadmap
