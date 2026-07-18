@@ -97,7 +97,8 @@
   #ailog .item .t{color:var(--purple)} #ailog .item .d{color:var(--dim)} #ailog .item .ts{color:#586069}
 
   /* Intercept editor */
-  #btnIntercept.on{background:var(--err);color:#fff;border-color:var(--err);font-weight:700}
+  header input.scope{width:150px}
+  #btnIntercept.on,#btnInterceptResp.on{background:var(--err);color:#fff;border-color:var(--err);font-weight:700}
   #intercept{position:fixed;inset:0;background:rgba(2,4,8,.72);display:none;
     flex-direction:column;align-items:center;justify-content:center;z-index:20;padding:4vh 4vw}
   #intercept.show{display:flex}
@@ -122,7 +123,9 @@
   <span class="stat"><b id="count">0</b> flows</span>
   <span class="grow"></span>
   <input type="text" id="filter" placeholder="filter host / path / method…" autocomplete="off">
-  <button id="btnIntercept" title="Hold requests at a breakpoint to edit/drop them">⏸ Intercept: off</button>
+  <input type="text" id="scope" class="scope" placeholder="scope: host,host…" title="Limit intercept to these hosts (comma-separated; empty = all)" autocomplete="off">
+  <button id="btnIntercept" title="Hold requests at a breakpoint to edit/drop them">⏸ Req: off</button>
+  <button id="btnInterceptResp" title="Also hold responses">⏸ Resp: off</button>
   <button id="btnNotify" title="Desktop popups when the AI acts">🔔 Popups: off</button>
   <button id="btnAuto" class="active" title="Auto-scroll to newest">⤓ Auto</button>
   <button id="btnClear" title="Clear the view (does not delete stored flows)">Clear</button>
@@ -163,7 +166,7 @@
 
 <div id="intercept">
   <div class="ihead">
-    <span class="paused">⏸ REQUEST HELD</span>
+    <span class="paused" id="ipaused">⏸ REQUEST HELD</span>
     <span class="iq" id="iqueue"></span>
     <span class="grow"></span>
     <span class="hint">edit the raw request below, then</span>
@@ -178,7 +181,7 @@
   const $ = id => document.getElementById(id);
   const rows = $('rows'), countEl = $('count'), dot = $('dot');
   const state = { flows: new Map(), order: [], sel: null, detail: null, tab: 'req',
-                  auto: true, notify: false, filter: '', intercept: false, held: [] };
+                  auto: true, notify: false, filter: '', intercept: false, interceptResp: false, held: [] };
 
   // ---------- helpers ----------
   const esc = s => (s==null?'':String(s)).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -314,43 +317,58 @@
              query: qi>=0 ? target.slice(qi+1) : null,
              headers, body };
   }
+  function respToText(r){
+    let s = `${r.http_version||'HTTP/1.1'} ${r.status}\n`;
+    for(const [k,v] of (r.headers||[])) s += `${k}: ${v}\n`;
+    return s + '\n' + b64dec(r.body||'');
+  }
+  function textToResp(t){
+    const nl = t.indexOf('\n\n');
+    const head = nl>=0 ? t.slice(0,nl) : t;
+    const body = nl>=0 ? t.slice(nl+2) : '';
+    const lines = head.split('\n');
+    const first = (lines.shift()||'').trim().split(/\s+/);
+    const headers = [];
+    for(const ln of lines){ const c = ln.indexOf(':'); if(c>0) headers.push([ln.slice(0,c).trim(), ln.slice(c+1).trim()]); }
+    return { status: parseInt(first[1]||first[0])||200, headers, body };
+  }
   function renderIntercept(){
     const p = $('intercept');
     if(state.held.length === 0){ p.classList.remove('show'); return; }
     const item = state.held[0];
-    // Only (re)fill the editor when switching to a new held request.
-    if(p.dataset.id !== String(item.id)){
+    if(p.dataset.id !== String(item.id)){       // refill only on a new held item
       p.dataset.id = String(item.id);
-      $('iedit').value = reqToText(item.request);
+      $('iedit').value = item.kind==='resp' ? respToText(item.data) : reqToText(item.data);
     }
+    $('ipaused').textContent = item.kind==='resp' ? '⏸ RESPONSE HELD' : '⏸ REQUEST HELD';
     $('iqueue').textContent = state.held.length>1 ? `(+${state.held.length-1} more queued)` : '';
     p.classList.add('show');
     $('iedit').focus();
   }
   async function iresolve(action){
     const item = state.held[0]; if(!item) return;
-    $('intercept').dataset.id = '';           // force refill for the next one
+    $('intercept').dataset.id = '';             // force refill for the next one
     state.held = state.held.filter(h => h.id !== item.id);
     renderIntercept();
+    const base = `/api/v1/intercept/${item.id}`;
     if(action==='drop'){
-      await fetch(`/api/v1/intercept/${item.id}/drop`, {method:'POST'});
+      await fetch(item.kind==='resp' ? `${base}/drop-response` : `${base}/drop`, {method:'POST'});
+    } else if(item.kind==='resp'){
+      await fetch(`${base}/forward-response`, {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify(textToResp($('iedit').value))});
     } else {
-      const r = textToReq($('iedit').value);
-      await fetch(`/api/v1/intercept/${item.id}/forward`,
-        {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(r)});
+      await fetch(`${base}/forward`, {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify(textToReq($('iedit').value))});
     }
   }
-  async function toggleIntercept(){
-    const on = !state.intercept;
+  async function postToggle(b){
     await fetch('/api/v1/intercept',
-      {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({on})});
-    // state syncs via the intercept_state SSE event
+      {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(b)});
   }
-  function setInterceptBtn(on){
-    state.intercept = on;
-    const b = $('btnIntercept');
-    b.textContent = on ? '⏸ Intercept: ON' : '⏸ Intercept: off';
-    b.classList.toggle('on', on);
+  function setInterceptState(on, responses){
+    state.intercept = on; state.interceptResp = responses;
+    const b = $('btnIntercept'); b.textContent = on ? '⏸ Req: ON' : '⏸ Req: off'; b.classList.toggle('on', on);
+    const r = $('btnInterceptResp'); r.textContent = responses ? '⏸ Resp: ON' : '⏸ Resp: off'; r.classList.toggle('on', responses);
   }
 
   // ---------- SSE ----------
@@ -363,9 +381,15 @@
       if(m.event==='flow_new') upsert(m.summary, true);
       else if(m.event==='flow_update') upsert(m.summary, false);
       else if(m.event==='activity') onActivity(m.activity);
-      else if(m.event==='intercept_paused'){ state.held.push({id:m.id, request:m.request}); renderIntercept(); }
+      else if(m.event==='intercept_paused'){ state.held.push({id:m.id, kind:'req', data:m.request}); renderIntercept(); }
+      else if(m.event==='intercept_resp_paused'){ state.held.push({id:m.id, kind:'resp', data:m.response}); renderIntercept(); }
       else if(m.event==='intercept_resolved'){ state.held = state.held.filter(h=>h.id!==m.id); renderIntercept(); }
-      else if(m.event==='intercept_state'){ setInterceptBtn(m.on); if(!m.on){ state.held=[]; renderIntercept(); } }
+      else if(m.event==='intercept_state'){
+        setInterceptState(m.on, m.responses);
+        if(!m.on) state.held = state.held.filter(h=>h.kind!=='req');
+        if(!m.responses) state.held = state.held.filter(h=>h.kind!=='resp');
+        renderIntercept();
+      }
     };
   }
 
@@ -377,8 +401,12 @@
     }catch(e){}
     try{
       const s = await (await fetch('/api/v1/intercept')).json();
-      setInterceptBtn(!!s.on);
-      state.held = (s.queue||[]).map(q => ({id:q.id, request:q.request}));
+      setInterceptState(!!s.on, !!s.responses);
+      $('scope').value = (s.scope||[]).join(', ');
+      state.held = [
+        ...(s.queue||[]).map(q => ({id:q.id, kind:'req', data:q.request})),
+        ...(s.resp_queue||[]).map(q => ({id:q.id, kind:'resp', data:q.response})),
+      ];
       renderIntercept();
     }catch(e){}
   }
@@ -397,7 +425,13 @@
     e.target.textContent = state.notify ? '🔔 Popups: on' : '🔔 blocked';
     e.target.classList.toggle('active', state.notify);
   };
-  $('btnIntercept').onclick = toggleIntercept;
+  $('btnIntercept').onclick = () => postToggle({ on: !state.intercept });
+  $('btnInterceptResp').onclick = () => postToggle({ responses: !state.interceptResp });
+  $('scope').addEventListener('change', async e => {
+    const hosts = e.target.value.split(',').map(s => s.trim()).filter(Boolean);
+    await fetch('/api/v1/intercept/scope',
+      {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ hosts })});
+  });
   $('iforward').onclick = () => iresolve('forward');
   $('idrop').onclick = () => iresolve('drop');
   // Ctrl/Cmd+Enter = forward the held request quickly

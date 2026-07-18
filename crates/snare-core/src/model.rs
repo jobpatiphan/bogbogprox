@@ -146,10 +146,12 @@ pub enum FlowEvent {
     Activity { activity: Activity },
     /// A request is held at the intercept breakpoint, awaiting a decision.
     InterceptPaused { id: u64, request: HttpRequest },
-    /// A held request was forwarded or dropped (`action` = "forward" | "drop").
+    /// A response is held at the intercept breakpoint, awaiting a decision.
+    InterceptRespPaused { id: u64, response: HttpResponse },
+    /// A held request/response was forwarded or dropped ("forward" | "drop").
     InterceptResolved { id: u64, action: String },
-    /// Intercept was toggled on/off.
-    InterceptState { on: bool },
+    /// Intercept toggles changed (`on` = requests, `responses` = responses).
+    InterceptState { on: bool, responses: bool },
 }
 
 /// base64 (std, no padding issues) for byte bodies in JSON.

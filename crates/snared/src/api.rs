@@ -20,7 +20,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use snare_core::intercept::{Edit, Intercept};
+use snare_core::intercept::{Edit, Intercept, RespEdit};
 use snare_core::model::{Activity, FlowEvent, Header};
 use snare_core::store::{FlowQuery, FlowStore};
 use tokio::sync::broadcast;
@@ -57,8 +57,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/repeater", post(repeater_custom))
         .route("/api/v1/repeater/from/:id", post(repeater_from))
         .route("/api/v1/intercept", get(intercept_get).post(intercept_toggle))
+        .route("/api/v1/intercept/scope", post(intercept_scope))
         .route("/api/v1/intercept/:id/forward", post(intercept_forward))
         .route("/api/v1/intercept/:id/drop", post(intercept_drop))
+        .route("/api/v1/intercept/:id/forward-response", post(intercept_forward_resp))
+        .route("/api/v1/intercept/:id/drop-response", post(intercept_drop_resp))
         .with_state(state)
 }
 
@@ -169,30 +172,101 @@ async fn repeater_from(State(st): State<AppState>, Path(id): Path<i64>) -> Respo
 
 // ---- Interactive intercept (§5.1) ----
 
-/// Current intercept state + the queue of held requests.
+/// Current intercept state (both toggles + scope) and the held queues.
 async fn intercept_get(State(st): State<AppState>) -> Response {
     let queue: Vec<_> = st
         .intercept
         .queue()
         .into_iter()
-        .map(|(id, req)| json!({ "id": id, "request": req }))
+        .map(|(id, req)| json!({ "id": id, "kind": "request", "request": req }))
         .collect();
-    Json(json!({ "on": st.intercept.enabled(), "queue": queue })).into_response()
+    let resp_queue: Vec<_> = st
+        .intercept
+        .queue_responses()
+        .into_iter()
+        .map(|(id, resp)| json!({ "id": id, "kind": "response", "response": resp }))
+        .collect();
+    Json(json!({
+        "on": st.intercept.enabled(),
+        "responses": st.intercept.responses_enabled(),
+        "scope": st.intercept.scope(),
+        "queue": queue,
+        "resp_queue": resp_queue,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ToggleBody {
-    pub on: bool,
+    pub on: Option<bool>,
+    pub responses: Option<bool>,
 }
 
-/// Turn intercept on/off. Turning off releases everything currently held.
+/// Toggle request and/or response intercept. Turning a side off releases what it
+/// was holding so nothing hangs.
 async fn intercept_toggle(State(st): State<AppState>, Json(b): Json<ToggleBody>) -> Response {
-    st.intercept.set_enabled(b.on);
-    if !b.on {
-        st.intercept.release_all();
+    if let Some(on) = b.on {
+        st.intercept.set_enabled(on);
+        if !on {
+            st.intercept.release_requests();
+        }
     }
-    let _ = st.events.send(FlowEvent::InterceptState { on: b.on });
-    Json(json!({ "on": b.on })).into_response()
+    if let Some(r) = b.responses {
+        st.intercept.set_responses_enabled(r);
+        if !r {
+            st.intercept.release_responses();
+        }
+    }
+    let on = st.intercept.enabled();
+    let responses = st.intercept.responses_enabled();
+    let _ = st.events.send(FlowEvent::InterceptState { on, responses });
+    Json(json!({ "on": on, "responses": responses })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScopeBody {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// Set the intercept scope (host substrings; empty = every host).
+async fn intercept_scope(State(st): State<AppState>, Json(b): Json<ScopeBody>) -> Response {
+    st.intercept.set_scope(b.hosts);
+    Json(json!({ "scope": st.intercept.scope() })).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RespEditBody {
+    pub status: Option<u16>,
+    pub headers: Option<Vec<Header>>,
+    pub body: Option<String>,
+}
+
+/// Return a held response, applying any edits.
+async fn intercept_forward_resp(
+    State(st): State<AppState>,
+    Path(id): Path<u64>,
+    body: Option<Json<RespEditBody>>,
+) -> Response {
+    let edit = body.map(|Json(e)| RespEdit {
+        status: e.status,
+        headers: e.headers,
+        body: e.body.map(String::into_bytes),
+    });
+    if st.intercept.forward_response(id, edit) {
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such held response" }))).into_response()
+    }
+}
+
+/// Drop a held response.
+async fn intercept_drop_resp(State(st): State<AppState>, Path(id): Path<u64>) -> Response {
+    if st.intercept.discard_response(id) {
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such held response" }))).into_response()
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

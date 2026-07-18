@@ -26,7 +26,7 @@ use hudsucker::{
     rustls::crypto::aws_lc_rs,
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
-use snare_core::intercept::{Decision, Intercept};
+use snare_core::intercept::{Decision, Intercept, RespDecision};
 use snare_core::model::{
     FlowEvent, FlowSummary, Header, HttpRequest, HttpResponse, Source,
 };
@@ -48,8 +48,9 @@ struct CaptureHandler {
     store: Arc<dyn FlowStore>,
     events: broadcast::Sender<FlowEvent>,
     intercept: Arc<Intercept>,
-    /// Outstanding (flow_id, started) pairs, oldest first.
-    pending: VecDeque<(i64, Instant)>,
+    /// Outstanding (flow_id, started, host) tuples, oldest first. Host lets
+    /// response interception honour scope.
+    pending: VecDeque<(i64, Instant, String)>,
 }
 
 fn to_headers(map: &hudsucker::hyper::HeaderMap) -> Vec<Header> {
@@ -91,6 +92,26 @@ fn rebuild_parts(parts: &mut hudsucker::hyper::http::request::Parts, req: &HttpR
     }
     let mut headers = hudsucker::hyper::HeaderMap::new();
     for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case("content-length") {
+            continue; // hyper sets this from the actual body
+        }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            headers.append(name, val);
+        }
+    }
+    parts.headers = headers;
+}
+
+/// Apply an (edited) response model back onto the outgoing wire response.
+fn rebuild_resp_parts(parts: &mut hudsucker::hyper::http::response::Parts, resp: &HttpResponse) {
+    if let Ok(s) = StatusCode::from_u16(resp.status) {
+        parts.status = s;
+    }
+    let mut headers = hudsucker::hyper::HeaderMap::new();
+    for (k, v) in &resp.headers {
         if k.eq_ignore_ascii_case("content-length") {
             continue; // hyper sets this from the actual body
         }
@@ -180,7 +201,7 @@ impl HttpHandler for CaptureHandler {
         // Interactive intercept (§5.1): hold the request at the breakpoint until
         // the operator forwards (optionally edited) or drops it.
         let mut forwarded_bytes = bytes;
-        if self.intercept.enabled() {
+        if self.intercept.enabled() && self.intercept.in_scope(&request.host) {
             let (iid, rx) = self.intercept.register(request.clone());
             let _ = self.events.send(FlowEvent::InterceptPaused {
                 id: iid,
@@ -219,7 +240,8 @@ impl HttpHandler for CaptureHandler {
                 let _ = self.events.send(FlowEvent::FlowNew {
                     summary: summary_of_request(id, ts, &request),
                 });
-                self.pending.push_back((id, Instant::now()));
+                self.pending
+                    .push_back((id, Instant::now(), request.host.clone()));
             }
             Err(e) => tracing::warn!("store insert_request failed: {e:#}"),
         }
@@ -232,20 +254,60 @@ impl HttpHandler for CaptureHandler {
         _ctx: &HttpContext,
         res: Response<Body>,
     ) -> Response<Body> {
-        let (parts, body) = res.into_parts();
+        let (mut parts, body) = res.into_parts();
         let bytes = match body.collect().await {
             Ok(b) => b.to_bytes(),
             Err(_) => return Response::from_parts(parts, Body::empty()),
         };
 
-        let response = HttpResponse {
+        let mut response = HttpResponse {
             status: parts.status.as_u16(),
             http_version: format!("{:?}", parts.version),
             headers: to_headers(&parts.headers),
             body: bytes.to_vec(),
         };
+        let mut resp_bytes = bytes;
 
-        if let Some((id, started)) = self.pending.pop_front() {
+        let entry = self.pending.pop_front();
+        let host = entry.as_ref().map(|(_, _, h)| h.as_str()).unwrap_or("");
+
+        // Interactive intercept — response side. Hold it if response intercept is
+        // on and the originating host is in scope.
+        if self.intercept.responses_enabled() && self.intercept.in_scope(host) {
+            let (iid, rx) = self.intercept.register_response(response.clone());
+            let _ = self.events.send(FlowEvent::InterceptRespPaused {
+                id: iid,
+                response: response.clone(),
+            });
+            match rx.await {
+                Ok(RespDecision::Drop) => {
+                    let _ = self.events.send(FlowEvent::InterceptResolved {
+                        id: iid,
+                        action: "drop".into(),
+                    });
+                    response = HttpResponse {
+                        status: StatusCode::FORBIDDEN.as_u16(),
+                        http_version: response.http_version.clone(),
+                        headers: vec![],
+                        body: b"dropped by Snare".to_vec(),
+                    };
+                    resp_bytes = bytes::Bytes::from_static(b"dropped by Snare");
+                    rebuild_resp_parts(&mut parts, &response);
+                }
+                Ok(RespDecision::Forward(edited)) => {
+                    let _ = self.events.send(FlowEvent::InterceptResolved {
+                        id: iid,
+                        action: "forward".into(),
+                    });
+                    response = *edited;
+                    resp_bytes = bytes::Bytes::from(response.body.clone());
+                    rebuild_resp_parts(&mut parts, &response);
+                }
+                Err(_) => {}
+            }
+        }
+
+        if let Some((id, started, _)) = entry {
             let dur = started.elapsed().as_millis() as u64;
             if let Err(e) = self.store.attach_response(id, &response, dur) {
                 tracing::warn!("store attach_response failed: {e:#}");
@@ -259,7 +321,7 @@ impl HttpHandler for CaptureHandler {
             }
         }
 
-        Response::from_parts(parts, Body::from(Full::new(bytes)))
+        Response::from_parts(parts, Body::from(Full::new(resp_bytes)))
     }
 }
 

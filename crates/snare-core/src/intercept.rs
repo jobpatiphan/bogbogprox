@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use tokio::sync::oneshot;
 
-use crate::model::{Header, HttpRequest};
+use crate::model::{Header, HttpRequest, HttpResponse};
 
 /// What the operator decided for a held request.
 pub enum Decision {
@@ -19,6 +19,22 @@ pub enum Decision {
     Forward(Box<HttpRequest>),
     /// Drop it — the client gets a synthetic 403.
     Drop,
+}
+
+/// What the operator decided for a held response.
+pub enum RespDecision {
+    /// Return this (possibly edited) response to the client.
+    Forward(Box<HttpResponse>),
+    /// Drop it — the client gets a synthetic 403.
+    Drop,
+}
+
+/// Edits applied to a held response before returning it.
+#[derive(Debug, Default, Clone)]
+pub struct RespEdit {
+    pub status: Option<u16>,
+    pub headers: Option<Vec<Header>>,
+    pub body: Option<Vec<u8>>,
 }
 
 /// Edits applied to a held request before forwarding. Any `None` field keeps the
@@ -37,13 +53,22 @@ struct Pending {
     tx: oneshot::Sender<Decision>,
 }
 
+struct PendingResp {
+    response: HttpResponse,
+    tx: oneshot::Sender<RespDecision>,
+}
+
 /// Shared breakpoint coordinator. One instance, held behind an `Arc`, is shared
 /// by the engine (producer) and the API (consumer).
 #[derive(Default)]
 pub struct Intercept {
     enabled: AtomicBool,
+    resp_enabled: AtomicBool,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
+    pending_resp: Mutex<HashMap<u64, PendingResp>>,
+    /// Host substrings to limit intercept to; empty = every host.
+    scope: Mutex<Vec<String>>,
 }
 
 impl Intercept {
@@ -57,6 +82,28 @@ impl Intercept {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn responses_enabled(&self) -> bool {
+        self.resp_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_responses_enabled(&self, on: bool) {
+        self.resp_enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_scope(&self, hosts: Vec<String>) {
+        *self.scope.lock().unwrap() = hosts.into_iter().filter(|h| !h.trim().is_empty()).collect();
+    }
+
+    pub fn scope(&self) -> Vec<String> {
+        self.scope.lock().unwrap().clone()
+    }
+
+    /// True if `host` is in scope (or scope is empty, meaning "everything").
+    pub fn in_scope(&self, host: &str) -> bool {
+        let scope = self.scope.lock().unwrap();
+        scope.is_empty() || scope.iter().any(|s| host.contains(s.as_str()))
     }
 
     /// Hold a request; returns its id and a receiver the engine awaits.
@@ -112,12 +159,75 @@ impl Intercept {
         p.tx.send(Decision::Drop).is_ok()
     }
 
-    /// Forward everything currently held, unedited (used when turning intercept
-    /// off so nothing hangs).
-    pub fn release_all(&self) {
-        let drained: Vec<Pending> = self.pending.lock().unwrap().drain().map(|(_, p)| p).collect();
-        for p in drained {
+    /// Hold a response; returns its id and a receiver the engine awaits.
+    pub fn register_response(&self, response: HttpResponse) -> (u64, oneshot::Receiver<RespDecision>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        self.pending_resp
+            .lock()
+            .unwrap()
+            .insert(id, PendingResp { response, tx });
+        (id, rx)
+    }
+
+    /// Snapshot of held responses (id + response), for the queue view.
+    pub fn queue_responses(&self) -> Vec<(u64, HttpResponse)> {
+        let g = self.pending_resp.lock().unwrap();
+        let mut v: Vec<_> = g.iter().map(|(k, p)| (*k, p.response.clone())).collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    }
+
+    /// Return a held response, applying `edit`. Returns false if the id is gone.
+    pub fn forward_response(&self, id: u64, edit: Option<RespEdit>) -> bool {
+        let Some(p) = self.pending_resp.lock().unwrap().remove(&id) else {
+            return false;
+        };
+        let mut resp = p.response;
+        if let Some(e) = edit {
+            if let Some(s) = e.status {
+                resp.status = s;
+            }
+            if let Some(h) = e.headers {
+                resp.headers = h;
+            }
+            if let Some(b) = e.body {
+                resp.body = b;
+            }
+        }
+        p.tx.send(RespDecision::Forward(Box::new(resp))).is_ok()
+    }
+
+    /// Drop a held response. Returns false if the id is gone.
+    pub fn discard_response(&self, id: u64) -> bool {
+        let Some(p) = self.pending_resp.lock().unwrap().remove(&id) else {
+            return false;
+        };
+        p.tx.send(RespDecision::Drop).is_ok()
+    }
+
+    /// Forward all held requests unedited (used when request intercept is
+    /// turned off so nothing hangs).
+    pub fn release_requests(&self) {
+        let reqs: Vec<Pending> = self.pending.lock().unwrap().drain().map(|(_, p)| p).collect();
+        for p in reqs {
             let _ = p.tx.send(Decision::Forward(Box::new(p.request)));
         }
+    }
+
+    /// Forward all held responses unedited (used when response intercept is
+    /// turned off).
+    pub fn release_responses(&self) {
+        let resps: Vec<PendingResp> =
+            self.pending_resp.lock().unwrap().drain().map(|(_, p)| p).collect();
+        for p in resps {
+            let _ = p.tx.send(RespDecision::Forward(Box::new(p.response)));
+        }
+    }
+
+    /// Forward everything currently held, both directions.
+    pub fn release_all(&self) {
+        self.release_requests();
+        self.release_responses();
     }
 }
