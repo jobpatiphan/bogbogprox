@@ -1,0 +1,20 @@
+# Example Snare plugin — compiles to a WASM component.
+# Build: cargo build --release --target wasm32-wasip2
+# Detached from the host workspace (different target/crate-type).
+[workspace]
+
+[package]
+name = "header-tagger"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.36"
+
+[profile.release]
+opt-level = "s"
+strip = true

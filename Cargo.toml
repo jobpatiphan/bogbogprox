@@ -5,6 +5,7 @@ members = [
     "crates/snare-store-sqlite",
     "crates/snare-store-postgres",
     "crates/snare-engine",
+    "crates/snare-plugin",
     "crates/snared",
     "crates/snare-tui",
     "crates/snare-mcp",
