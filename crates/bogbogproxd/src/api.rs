@@ -64,7 +64,23 @@ pub struct AppState {
     pub ca_cert_path: std::path::PathBuf,
     /// Request-initiator map filled by the CDP bridge for the embedded browser.
     pub initiator_sink: bogbogprox_core::model::InitiatorSink,
+    /// Out-of-band (OAST) callback log — hits to `/oob/*` land here.
+    pub oob: OobLog,
 }
+
+/// A recorded out-of-band callback (blind SSRF/XXE/RCE interaction).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OobHit {
+    pub ts: i64,
+    pub method: String,
+    pub path: String,
+    pub host: Option<String>,
+    pub ua: Option<String>,
+    pub body: String,
+}
+
+/// Shared OAST hit log (newest last, capped).
+pub type OobLog = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<OobHit>>>;
 
 impl AppState {
     /// Persist rules/scope/scanner/vars/macros after a mutation. Best-effort.
@@ -147,6 +163,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/browser/launch", post(browser_launch))
         .route("/api/v1/ca", get(ca_info))
+        .route("/api/v1/oob", get(oob_list).post(oob_clear))
+        .route("/oob/*rest", axum::routing::any(oob_hit))
         .route("/api/v1/sequencer", post(sequencer_run))
         .route("/api/v1/vars", get(vars_list).put(vars_set))
         .route("/api/v1/vars/:name", axum::routing::delete(vars_delete))
@@ -1298,6 +1316,59 @@ async fn report(State(st): State<AppState>, Query(p): Query<ReportParams>) -> Re
             ([("content-type", "text/markdown; charset=utf-8")], md).into_response()
         }
     }
+}
+
+// ---- OAST / out-of-band collaborator ----
+
+const OOB_CAP: usize = 500;
+
+/// Record any hit to `/oob/*` — the callback endpoint an operator injects into a
+/// target for blind SSRF/XXE/RCE. Returns a tiny 200 so the interaction looks
+/// benign. Exempt from auth (targets have no token).
+async fn oob_hit(
+    State(st): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let hdr = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
+    let hit = OobHit {
+        ts: bogbogprox_core::now_millis(),
+        method: method.to_string(),
+        path: uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default(),
+        host: hdr("host"),
+        ua: hdr("user-agent"),
+        body: String::from_utf8_lossy(&body[..body.len().min(2048)]).into_owned(),
+    };
+    if let Ok(mut log) = st.oob.lock() {
+        log.push_back(hit);
+        while log.len() > OOB_CAP {
+            log.pop_front();
+        }
+    }
+    ([("content-type", "text/plain")], "ok\n").into_response()
+}
+
+async fn oob_list(State(st): State<AppState>) -> Response {
+    let hits: Vec<OobHit> = st
+        .oob
+        .lock()
+        .map(|l| l.iter().cloned().collect())
+        .unwrap_or_default();
+    Json(hits).into_response()
+}
+
+async fn oob_clear(State(st): State<AppState>) -> Response {
+    if let Ok(mut l) = st.oob.lock() {
+        l.clear();
+    }
+    Json(json!({ "ok": true })).into_response()
 }
 
 // ---- CA certificate (for the in-app tutorial) ----

@@ -290,6 +290,7 @@ async fn cmd_run(
         proxy_addr,
         ca_cert_path: paths.ca_cert(),
         initiator_sink: initiator_sink.clone(),
+        oob: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind(api_addr)
         .await
