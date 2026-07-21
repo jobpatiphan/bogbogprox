@@ -59,6 +59,9 @@ pub struct AppState {
     /// Proxy listen address — so the dashboard "Open browser" button can wire a
     /// launched browser to it.
     pub proxy_addr: std::net::SocketAddr,
+    /// Path to the MITM CA certificate — served by the in-app CA tutorial so
+    /// operators can download and trust it in other browsers.
+    pub ca_cert_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -139,6 +142,7 @@ pub fn router(state: AppState) -> Router {
             post(flow_note_set).delete(flow_note_delete),
         )
         .route("/api/v1/browser/launch", post(browser_launch))
+        .route("/api/v1/ca", get(ca_info))
         .route("/api/v1/sequencer", post(sequencer_run))
         .route("/api/v1/vars", get(vars_list).put(vars_set))
         .route("/api/v1/vars/:name", axum::routing::delete(vars_delete))
@@ -1119,6 +1123,24 @@ async fn report(State(st): State<AppState>, Query(p): Query<ReportParams>) -> Re
             }
             ([("content-type", "text/markdown; charset=utf-8")], md).into_response()
         }
+    }
+}
+
+// ---- CA certificate (for the in-app tutorial) ----
+
+/// Return the MITM CA certificate path and PEM so the dashboard can show the
+/// install tutorial and offer a download. The CA is a public certificate (the
+/// private key is never exposed).
+async fn ca_info(State(st): State<AppState>) -> Response {
+    let path = st.ca_cert_path.display().to_string();
+    match std::fs::read_to_string(&st.ca_cert_path) {
+        Ok(pem) => Json(json!({ "path": path, "pem": pem })).into_response(),
+        Err(_) => Json(json!({
+            "path": path,
+            "pem": null,
+            "error": "CA not generated yet — run `bogbogproxd ca generate`"
+        }))
+        .into_response(),
     }
 }
 

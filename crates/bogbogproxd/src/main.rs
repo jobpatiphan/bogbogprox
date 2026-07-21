@@ -284,6 +284,7 @@ async fn cmd_run(
         remote_events: remote_events.clone(),
         config: config_backend,
         proxy_addr,
+        ca_cert_path: paths.ca_cert(),
     });
     let listener = tokio::net::TcpListener::bind(api_addr)
         .await

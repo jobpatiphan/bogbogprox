@@ -305,6 +305,36 @@
   #writeup .wtools button{background:var(--accent);color:#000;border:0;padding:5px 12px;border-radius:6px;cursor:pointer;font-weight:700}
   #writeup .wtools label{display:flex;align-items:center;gap:5px;cursor:pointer}
   #writeup pre{margin:0;overflow:auto;padding:14px;font-family:var(--mono);font-size:12px;line-height:1.55;color:#c9d1d9;white-space:pre-wrap;word-break:break-word}
+  /* ---- Help / tutorial ---- */
+  #help{position:fixed;inset:0;background:rgba(2,4,8,.72);display:none;align-items:center;justify-content:center;z-index:25}
+  #help.show{display:flex}
+  #help .hbox{width:min(860px,95vw);max-height:90vh;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;overflow:hidden}
+  #help .rhead{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);font-weight:700;font-size:15px}
+  #help .rhead .grow{flex:1} #help .rhead span.x{cursor:pointer;color:var(--dim)}
+  #help .htabs{display:flex;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  #help .htabs button{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--dim);
+    padding:7px 12px;cursor:pointer;font-size:13px;font-weight:600}
+  #help .htabs button.active{color:var(--accent);border-bottom-color:var(--accent)}
+  #help .hbody{overflow:auto;padding:18px 20px}
+  #help .hpane{display:none} #help .hpane.active{display:block}
+  #help h4{margin:0 0 8px;font-size:14px;color:var(--fg)}
+  #help p,#help li{color:var(--dim);font-size:13px;line-height:1.6}
+  #help ol,#help ul{margin:6px 0 16px;padding-left:22px}
+  #help b{color:var(--fg)}
+  #help code{font-family:var(--mono);font-size:12px;background:var(--panel2);border:1px solid var(--line);
+    padding:1px 6px;border-radius:5px;color:var(--accent2)}
+  #help pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow:auto;
+    font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--fg);margin:8px 0 16px;white-space:pre-wrap;word-break:break-word}
+  #help .cabar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--panel2);border:1px solid var(--line);
+    border-radius:9px;padding:11px 13px;margin-bottom:16px}
+  #help .cabar code{background:var(--ink)}
+  #help .cabar .grow{flex:1}
+  #help .cabar button{background:var(--accent);color:#160a02;border:0;padding:7px 14px;border-radius:7px;cursor:pointer;font-weight:700;font-size:12.5px}
+  #help .step-t{color:var(--accent2);font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+  #help .menu-row{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+  #help .menu-row:last-child{border-bottom:0}
+  #help .menu-row .mk{font-family:var(--mono);color:var(--accent2);white-space:nowrap;min-width:118px}
+  #help .menu-row .mv{color:var(--dim)}
 </style>
 </head>
 <body>
@@ -329,6 +359,8 @@
   <button id="btnDecoder" title="Encode / decode">🔧 Decoder</button>
   <button id="btnWriteup" title="Curate annotated flows into a paste-ready writeup">📝 Writeup</button>
   <button id="btnBrowser" title="Open a throwaway browser wired to the proxy">🌐 Browser</button>
+  <button id="btnHelp" title="Getting started · install the CA · what the menus do">❓ Help</button>
+  <button id="btnNoise" title="Hide known telemetry / ads / beacon traffic (Google, analytics, safebrowsing…)">🔇 Noise: off</button>
   <button id="btnNotify" title="Desktop popups when the AI acts">🔔 Popups: off</button>
   <button id="btnAuto" class="active" title="Auto-scroll to newest">⤓ Auto</button>
   <button id="btnClear" title="Clear the view (does not delete stored flows)">Clear</button>
@@ -499,6 +531,100 @@
   </div>
 </div>
 
+<div id="help">
+  <div class="hbox">
+    <div class="rhead">🪤 BogBogProx — Help <span class="grow"></span><span class="x" id="helpClose">✕</span></div>
+    <div class="htabs">
+      <button data-h="start" class="active">Getting started</button>
+      <button data-h="ca">Install the CA</button>
+      <button data-h="menus">Menus</button>
+      <button data-h="ai">Connect AI (MCP)</button>
+    </div>
+    <div class="hbody">
+
+      <div class="hpane active" data-p="start">
+        <h4>1 · Point a client at the proxy</h4>
+        <p>BogBogProx captures anything routed through its proxy. Fastest path — the toolbar
+        <b>🌐 Browser</b> button opens a throwaway browser already wired to it. Or send traffic yourself:</p>
+        <pre>curl -x http://127.0.0.1:8888 --cacert "$CA" https://example.com</pre>
+        <h4>2 · Trust the CA (for HTTPS)</h4>
+        <p>HTTPS is intercepted with BogBogProx's own certificate authority. The throwaway browser and the
+        stealth browser accept it automatically; your <b>own</b> browser needs the CA imported once — see the
+        <b>Install the CA</b> tab.</p>
+        <h4>3 · Watch &amp; act</h4>
+        <p>Flows stream into the table live. Click one to see request/response, then
+        <b>↻ Resend · ✎ Edit · ⚔ Intruder · 🛡 Scan · 📝 Note</b>. See the <b>Menus</b> tab for the full toolbar.</p>
+      </div>
+
+      <div class="hpane" data-p="ca">
+        <div class="cabar">
+          <span class="step-t">CA file</span>
+          <code id="caPath">loading…</code>
+          <span class="grow"></span>
+          <button id="caDownload">⬇ Download CA</button>
+        </div>
+        <h4>Firefox</h4>
+        <ol>
+          <li>Menu → <b>Settings</b> → search "certificates" → <b>View Certificates…</b></li>
+          <li><b>Authorities</b> tab → <b>Import…</b> → pick <code>bogbogprox-ca.pem</code></li>
+          <li>Tick <b>“Trust this CA to identify websites”</b> → OK. Firefox uses its own store, so this is required even if the OS already trusts it.</li>
+        </ol>
+        <h4>Chrome / Chromium / Edge / Brave</h4>
+        <ol>
+          <li><b>Settings</b> → <b>Privacy and security</b> → <b>Security</b> → <b>Manage certificates</b></li>
+          <li><b>Authorities</b> tab → <b>Import</b> → choose the file → tick <b>“Trust this certificate for identifying websites”</b></li>
+          <li>Linux Chrome may read the system store instead — then use the OS steps below.</li>
+        </ol>
+        <h4>Operating system (trust everywhere)</h4>
+        <pre># Linux (Debian/Kali/Ubuntu)
+sudo cp bogbogprox-ca.pem /usr/local/share/ca-certificates/bogbogprox-ca.crt
+sudo update-ca-certificates
+
+# macOS
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain bogbogprox-ca.pem
+
+# Windows (admin PowerShell)
+Import-Certificate -FilePath bogbogprox-ca.pem `
+  -CertStoreLocation Cert:\LocalMachine\Root</pre>
+        <p><b>Note:</b> the CA is a public certificate — its private key never leaves the daemon. Remove it from the trust store when you're done testing.</p>
+      </div>
+
+      <div class="hpane" data-p="menus">
+        <h4>Toolbar</h4>
+        <div class="menu-row"><span class="mk">filter</span><span class="mv">HTTPQL — <code>field:value</code> (status/host/path/method/mime/source), <code>!</code> negates, space = AND. Hides noise fast.</span></div>
+        <div class="menu-row"><span class="mk">scope</span><span class="mv">Limit intercept to given hosts (comma-separated).</span></div>
+        <div class="menu-row"><span class="mk">⏸ Req / ⏸ Resp</span><span class="mv">Breakpoint — hold requests / responses to edit or drop before they continue.</span></div>
+        <div class="menu-row"><span class="mk">⚙ M&amp;R</span><span class="mv">Match &amp; Replace — auto-rewrite parts of every request/response by regex.</span></div>
+        <div class="menu-row"><span class="mk">🔑 Session</span><span class="mv">Variables + macros — fetch a token and inject <code>{{var}}</code> so auth stays fresh.</span></div>
+        <div class="menu-row"><span class="mk">⚠ Findings</span><span class="mv">Passive + active scanner results; export report / SARIF.</span></div>
+        <div class="menu-row"><span class="mk">🗺 Sitemap / 🔌 WS</span><span class="mv">Captured hosts→paths · WebSocket messages.</span></div>
+        <div class="menu-row"><span class="mk">⚖ Compare / 🎲 Seq / 🔧 Decoder</span><span class="mv">Diff two items · token randomness · Base64/URL/Hex/JWT.</span></div>
+        <div class="menu-row"><span class="mk">📝 Writeup</span><span class="mv">Turn annotated flows into a paste-ready narrated Markdown report.</span></div>
+        <div class="menu-row"><span class="mk">🌐 Browser</span><span class="mv">Open a throwaway browser already wired to the proxy.</span></div>
+        <h4 style="margin-top:16px">On a selected flow</h4>
+        <div class="menu-row"><span class="mk">↻ Resend / ✎ Edit</span><span class="mv">Repeater — replay as-is or tweak &amp; send.</span></div>
+        <div class="menu-row"><span class="mk">⚔ Intruder</span><span class="mv">Fuzz a marked position with a payload list.</span></div>
+        <div class="menu-row"><span class="mk">🛡 Scan</span><span class="mv">Active-scan query params for reflected-XSS / error-SQLi.</span></div>
+        <div class="menu-row"><span class="mk">📝 Note</span><span class="mv">Annotate for the writeup — label, note, step, highlight, colour.</span></div>
+      </div>
+
+      <div class="hpane" data-p="ai">
+        <h4>Let an AI agent drive BogBogProx</h4>
+        <p><code>bogbogprox-mcp</code> is a stdio MCP server. Point any MCP client (e.g. Claude Code) at it —
+        every tool call also flashes on this dashboard so you see what the agent does in real time:</p>
+        <pre id="mcpSnippet">loading…</pre>
+        <p>Tools: <code>proxy_list_flows</code> · <code>proxy_get_flow</code> · <code>proxy_stats</code> ·
+        <code>repeater_send</code> · <code>intruder_run</code> · <code>active_scan</code> ·
+        <code>annotate_flow</code> · <code>report_writeup</code>.</p>
+        <p>When the agent resends or fuzzes a request, the resulting flow streams into the table tagged by
+        source — so you watch its actions land live.</p>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <div id="findings">
   <div class="fbox">
     <div class="rhead">⚠ Passive scan findings <span class="grow"></span>
@@ -585,7 +711,7 @@
 
   const state = { flows: new Map(), order: [], sel: null, detail: null, tab: 'req',
                   auto: true, notify: false, query: [], intercept: false, interceptResp: false, held: [], findings: [], ws: [],
-                  annotations: new Map() };
+                  annotations: new Map(), hideNoise: false };
 
   // ---------- helpers ----------
   const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g, c => ({
@@ -625,7 +751,12 @@
     const ok = hay.includes(t.val);
     return t.neg ? !ok : ok;
   }
+  // Built-in denylist of telemetry / ads / beacon traffic that clutters the
+  // view. Matched against host+path so page-level beacons (gen_204, /xjs) go too.
+  const NOISE_RE = /(googlesyndication|doubleclick|adtrafficquality|google-analytics|googletagmanager|googletagservices|gvt[12]\.com|update\.googleapis|safebrowsing\.googleapis|optimizationguide-pa\.googleapis|clientservices\.googleapis|clients[0-9]+\.google|accounts\.google\.com|play\.google\.com|android\.clients\.google|beacons?\.gvt|\/gen_204|\/generate_204|\/xjs\/|\/c2dm\/|chrome-variations)/i;
+  function isNoise(f){ return NOISE_RE.test((f.host||'') + (f.path||'')); }
   function matches(f){
+    if(state.hideNoise && isNoise(f)) return false;
     if(!state.query || !state.query.length) return true;
     return state.query.every(t => matchTerm(f, t));
   }
@@ -1273,10 +1404,17 @@
   }
 
   // ---------- controls ----------
+  function reapplyFilter(){ state.flows.forEach(({f,el}) => el.style.display = matches(f)?'':'none'); }
   $('filter').addEventListener('input', e => {
     state.query = parseQuery(e.target.value);
-    state.flows.forEach(({f,el}) => el.style.display = matches(f)?'':'none');
+    reapplyFilter();
   });
+  $('btnNoise').onclick = e => {
+    state.hideNoise = !state.hideNoise;
+    e.target.classList.toggle('active', state.hideNoise);
+    e.target.textContent = '🔇 Noise: ' + (state.hideNoise ? 'hidden' : 'off');
+    reapplyFilter();
+  };
   $('btnAuto').onclick = e => { state.auto=!state.auto; e.target.classList.toggle('active',state.auto); };
   $('btnClear').onclick = () => { rows.innerHTML=''; state.flows.clear(); state.order=[]; countEl.textContent=0; };
   $('btnNotify').onclick = async e => {
@@ -1345,6 +1483,38 @@
       b.textContent = d.ok ? ('🌐 '+d.browser) : '🌐 failed';
     }catch(e){ b.textContent = '🌐 failed'; }
     setTimeout(()=>{ b.textContent = t; b.disabled = false; }, 1600);
+  };
+  // Help / tutorial
+  let caPem = null;
+  async function loadHelp(){
+    try{
+      const d = await (await fetch('/api/v1/ca')).json();
+      $('caPath').textContent = d.path || 'unknown';
+      caPem = d.pem || null;
+      $('caDownload').disabled = !caPem;
+    }catch(e){ $('caPath').textContent = 'unavailable'; }
+    const origin = location.origin;
+    $('mcpSnippet').textContent =
+`{
+  "command": "/path/to/target/debug/bogbogprox-mcp",
+  "env": {
+    "BOGBOGPROX_API": "${origin}",
+    "BOGBOGPROX_AGENT": "claude"
+  }
+}`;
+  }
+  $('btnHelp').onclick = () => { $('help').classList.add('show'); loadHelp(); };
+  $('helpClose').onclick = () => $('help').classList.remove('show');
+  document.querySelectorAll('#help .htabs button').forEach(b => b.onclick = () => {
+    document.querySelectorAll('#help .htabs button').forEach(x => x.classList.toggle('active', x===b));
+    document.querySelectorAll('#help .hpane').forEach(p => p.classList.toggle('active', p.dataset.p===b.dataset.h));
+  });
+  $('caDownload').onclick = () => {
+    if(!caPem) return;
+    const blob = new Blob([caPem], {type:'application/x-pem-file'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'bogbogprox-ca.pem';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href);
   };
   // Writeup panel
   $('btnWriteup').onclick = () => { $('writeup').classList.add('show'); loadWriteup(); };
