@@ -225,6 +225,8 @@ fn summary_of_request(id: i64, ts: i64, req: &HttpRequest) -> FlowSummary {
         mime: None,
         resp_size: None,
         duration_ms: None,
+        wait_ms: None,
+        download_ms: None,
     }
 }
 
@@ -396,6 +398,9 @@ impl HttpHandler for CaptureHandler {
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        // Response headers just arrived — mark it so we can split the waterfall
+        // into wait (request → headers) and download (headers → full body).
+        let headers_at = Instant::now();
         let (mut parts, body) = res.into_parts();
         let captured_body = match capture_body(body, MAX_CAPTURE_BODY_BYTES).await {
             Ok(body) => body,
@@ -505,6 +510,9 @@ impl HttpHandler for CaptureHandler {
 
         if let Some((id, started, _)) = entry {
             let dur = started.elapsed().as_millis() as u64;
+            // Waterfall split: download = headers → body done; wait = the rest.
+            let download = headers_at.elapsed().as_millis() as u64;
+            let wait = dur.saturating_sub(download);
             if let Err(e) = self.store.attach_response(id, &response, dur) {
                 tracing::warn!("store attach_response failed: {e:#}");
             } else if let Ok(Some(flow)) = self.store.get_flow(id) {
@@ -513,6 +521,8 @@ impl HttpHandler for CaptureHandler {
                 summary.mime = response.mime().map(|s| s.to_string());
                 summary.resp_size = Some(response.body.len() as u64);
                 summary.duration_ms = Some(dur);
+                summary.wait_ms = Some(wait);
+                summary.download_ms = Some(download);
                 let _ = self.events.send(FlowEvent::FlowUpdate { summary });
                 // Passive scan the completed flow; stream any new findings.
                 for finding in self.scanner.scan(&flow) {

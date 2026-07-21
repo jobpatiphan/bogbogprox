@@ -205,6 +205,13 @@ pub struct FlowSummary {
     pub mime: Option<String>,
     pub resp_size: Option<u64>,
     pub duration_ms: Option<u64>,
+    /// Waterfall (Phase 1, live only): time from request sent to response
+    /// headers (TTFB-ish). `None` for flows loaded from storage.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    /// Waterfall (Phase 1, live only): time spent reading the response body.
+    #[serde(default)]
+    pub download_ms: Option<u64>,
 }
 
 /// An AI / automation action, surfaced live so the operator can watch — in

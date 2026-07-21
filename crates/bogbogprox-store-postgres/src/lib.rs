@@ -320,6 +320,8 @@ impl FlowStore for PostgresStore {
                     mime: r.get(9),
                     resp_size: r.get::<_, Option<i64>>(10).map(|v| v as u64),
                     duration_ms: r.get::<_, Option<i64>>(11).map(|v| v as u64),
+                    wait_ms: None,
+                    download_ms: None,
                 })
                 .collect())
         })

@@ -335,6 +335,16 @@
   #help .menu-row:last-child{border-bottom:0}
   #help .menu-row .mk{font-family:var(--mono);color:var(--accent2);white-space:nowrap;min-width:118px}
   #help .menu-row .mv{color:var(--dim)}
+  /* ---- flow detail meta: capture time + waterfall ---- */
+  #dMeta{display:none;flex-direction:column;gap:6px;padding:8px 12px;border-bottom:1px solid var(--line);
+    font-family:var(--mono);font-size:11px;color:var(--dim);background:var(--panel)}
+  #dMeta.show{display:flex}
+  #dMeta .row{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+  #dMeta b{color:var(--fg)}
+  #dMeta .wf{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--panel2);width:100%}
+  #dMeta .wf .seg{height:100%}
+  #dMeta .wf .wait{background:#d9b02b} #dMeta .wf .dl{background:#3fb950}
+  #dMeta .lg-wait{color:#d9b02b} #dMeta .lg-dl{color:#3fb950}
 </style>
 </head>
 <body>
@@ -391,6 +401,7 @@
       <button data-t="req" class="active">Request</button>
       <button data-t="res">Response</button>
     </div>
+    <div id="dMeta"></div>
     <pre class="body" id="dBody"></pre>
   </div>
 </main>
@@ -824,6 +835,7 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
       $('activescan').onclick = () => activeScan(id);
       const nb=$('btnNote'); if(state.annotations.has(id)) nb.classList.add('on');
       nb.onclick = () => openNote(id);
+      renderMeta(state.flows.get(id)?.f);
       renderDetail();
     }catch(e){ $('dHead').innerHTML='<span class="s5">failed to load</span>'; }
   }
@@ -838,6 +850,26 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
     if(btn){ btn.disabled=false; btn.textContent='↻ Resend'; }
   }
 
+  function fullDateTime(ms){
+    const d = new Date(ms); const p = n => String(n).padStart(2,'0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function renderMeta(s){
+    const m = $('dMeta');
+    if(!s){ m.classList.remove('show'); m.innerHTML=''; return; }
+    let html = `<div class="row">🕑 <b>${fullDateTime(s.ts)}</b><span>flow #${s.id}</span></div>`;
+    if(s.wait_ms!=null && s.download_ms!=null){
+      const tot = s.duration_ms || (s.wait_ms + s.download_ms) || 1;
+      const wpct = Math.min(98, Math.max(2, Math.round(100*s.wait_ms/tot)));
+      html += `<div class="wf"><div class="seg wait" style="width:${wpct}%"></div><div class="seg dl" style="width:${100-wpct}%"></div></div>`+
+        `<div class="row"><span>⏱ <b>${s.duration_ms??'–'} ms</b> total</span>`+
+        `<span class="lg-wait">■ wait ${s.wait_ms} ms</span>`+
+        `<span class="lg-dl">■ download ${s.download_ms} ms</span></div>`;
+    } else if(s.duration_ms!=null){
+      html += `<div class="row"><span>⏱ <b>${s.duration_ms} ms</b> total</span><span style="color:var(--dim)">(waterfall shows for flows captured live)</span></div>`;
+    }
+    m.innerHTML = html; m.classList.add('show');
+  }
   function headerBlock(hs){ return (hs||[]).map(([k,v])=>`<span class="kv"><b>${esc(k)}</b>: ${esc(v)}</span>`).join('\n'); }
 
   function detectGraphQL(rq){

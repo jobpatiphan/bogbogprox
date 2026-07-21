@@ -286,6 +286,8 @@ fn summary_from(flow: &Flow) -> FlowSummary {
             .and_then(|r| r.mime().map(String::from)),
         resp_size: flow.response.as_ref().map(|r| r.body.len() as u64),
         duration_ms: flow.duration_ms,
+        wait_ms: None,
+        download_ms: None,
     }
 }
 

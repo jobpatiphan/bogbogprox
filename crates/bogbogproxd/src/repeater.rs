@@ -39,6 +39,8 @@ fn summary_of_request(id: i64, ts: i64, req: &HttpRequest, source: Source) -> Fl
         mime: None,
         resp_size: None,
         duration_ms: None,
+        wait_ms: None,
+        download_ms: None,
     }
 }
 
