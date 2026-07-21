@@ -43,6 +43,60 @@ use tokio::sync::broadcast;
 
 pub use ca::{generate_ca, GeneratedCa};
 
+// ---- Phase 2 waterfall: instrumented upstream connector ----
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex as StdMutex;
+use std::task::{Context as TaskCtx, Poll};
+use tower_service::Service;
+
+/// Per-host queue of measured connect times (DNS+TCP+TLS) that have not yet been
+/// attributed to a flow. Connections are pooled, so only *new* connections
+/// produce an entry; a reused connection leaves the queue empty for that host
+/// (which correctly shows "no connect phase", like DevTools).
+type ConnectSink = Arc<StdMutex<HashMap<String, VecDeque<u64>>>>;
+
+/// Wraps hudsucker's upstream connector to time how long each new connection
+/// takes to establish, pushing the result onto [`ConnectSink`] keyed by host.
+#[derive(Clone)]
+struct TimedConnector<C> {
+    inner: C,
+    sink: ConnectSink,
+}
+
+impl<C> Service<Uri> for TimedConnector<C>
+where
+    C: Service<Uri> + Clone + Send + 'static,
+    C::Future: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<C::Response, C::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut TaskCtx<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let host = uri.host().unwrap_or("").to_string();
+        let start = Instant::now();
+        let fut = self.inner.call(uri);
+        let sink = self.sink.clone();
+        Box::pin(async move {
+            let res = fut.await;
+            if res.is_ok() {
+                let ms = start.elapsed().as_millis() as u64;
+                if let Ok(mut map) = sink.lock() {
+                    map.entry(host).or_default().push_back(ms);
+                }
+            }
+            res
+        })
+    }
+}
+
 /// Maximum request/response prefix retained in memory and persisted. Bodies
 /// larger than this are streamed through in full and marked as truncated in
 /// the capture model.
@@ -109,6 +163,8 @@ struct CaptureHandler {
     scanner: Arc<Scanner>,
     vars: Arc<Vars>,
     plugins: Arc<bogbogprox_plugin::PluginHost>,
+    /// Connect-time measurements from the instrumented connector (per host).
+    connect_sink: ConnectSink,
     /// Outstanding (flow_id, started, host) tuples, oldest first. Host lets
     /// response interception honour scope.
     pending: VecDeque<(i64, Instant, String)>,
@@ -225,6 +281,7 @@ fn summary_of_request(id: i64, ts: i64, req: &HttpRequest) -> FlowSummary {
         mime: None,
         resp_size: None,
         duration_ms: None,
+        connect_ms: None,
         wait_ms: None,
         download_ms: None,
     }
@@ -523,6 +580,13 @@ impl HttpHandler for CaptureHandler {
                 summary.duration_ms = Some(dur);
                 summary.wait_ms = Some(wait);
                 summary.download_ms = Some(download);
+                // Attribute a fresh connect (if the connector just made one for
+                // this host) to this flow; reused connections leave it None.
+                summary.connect_ms = self
+                    .connect_sink
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.get_mut(&flow.request.host).and_then(|q| q.pop_front()));
                 let _ = self.events.send(FlowEvent::FlowUpdate { summary });
                 // Passive scan the completed flow; stream any new findings.
                 for finding in self.scanner.scan(&flow) {
@@ -615,6 +679,8 @@ where
         wslog,
         plugins,
     } = services;
+    let connect_sink: ConnectSink = Arc::new(StdMutex::new(HashMap::new()));
+
     let handler = CaptureHandler {
         store,
         events: events.clone(),
@@ -623,14 +689,47 @@ where
         scanner,
         vars,
         plugins,
+        connect_sink: connect_sink.clone(),
         pending: VecDeque::new(),
     };
     let ws_handler = WsHandler { events, wslog };
 
+    // Build hudsucker's upstream client *ourselves* so we can wrap the connector
+    // with connect-timing. This mirrors hudsucker 0.23's `with_rustls_client`
+    // exactly (same rustls config + http1 header options), then swaps in the
+    // TimedConnector and supplies the matching WebSocket connector.
+    use hudsucker::hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use hudsucker::rustls::ClientConfig;
+    use hudsucker::tokio_tungstenite::Connector as WsConnector;
+    use hyper_rustls::ConfigBuilderExt;
+
+    let rustls_config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("rustls protocol versions")?
+        .with_webpki_roots()
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(rustls_config.clone())
+        .https_or_http()
+        .enable_http1()
+        .build();
+
+    let timed = TimedConnector {
+        inner: https,
+        sink: connect_sink,
+    };
+
+    let client = Client::builder(TokioExecutor::new())
+        .http1_title_case_headers(true)
+        .http1_preserve_header_case(true)
+        .build(timed);
+
     let proxy = Proxy::builder()
         .with_addr(cfg.listen)
         .with_ca(ca)
-        .with_rustls_client(aws_lc_rs::default_provider())
+        .with_client(client)
+        .with_websocket_connector(WsConnector::Rustls(Arc::new(rustls_config)))
         .with_http_handler(handler)
         .with_websocket_handler(ws_handler)
         .with_graceful_shutdown(shutdown)

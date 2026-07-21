@@ -432,8 +432,11 @@ dependencies = [
  "http-body-util",
  "hudsucker",
  "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rcgen",
  "tokio",
+ "tower-service",
  "tracing",
 ]
 

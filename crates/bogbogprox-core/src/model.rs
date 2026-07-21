@@ -205,11 +205,15 @@ pub struct FlowSummary {
     pub mime: Option<String>,
     pub resp_size: Option<u64>,
     pub duration_ms: Option<u64>,
-    /// Waterfall (Phase 1, live only): time from request sent to response
-    /// headers (TTFB-ish). `None` for flows loaded from storage.
+    /// Waterfall (live only): time to establish a new upstream connection
+    /// (DNS + TCP + TLS). `None` when the connection was reused from the pool.
+    #[serde(default)]
+    pub connect_ms: Option<u64>,
+    /// Waterfall (live only): time from request sent to response headers
+    /// (TTFB-ish). `None` for flows loaded from storage.
     #[serde(default)]
     pub wait_ms: Option<u64>,
-    /// Waterfall (Phase 1, live only): time spent reading the response body.
+    /// Waterfall (live only): time spent reading the response body.
     #[serde(default)]
     pub download_ms: Option<u64>,
 }

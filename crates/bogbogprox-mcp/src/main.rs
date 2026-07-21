@@ -549,6 +549,7 @@ mod tests {
             mime: None,
             resp_size: None,
             duration_ms: None,
+            connect_ms: None,
             wait_ms: None,
             download_ms: None,
         }

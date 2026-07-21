@@ -17,3 +17,9 @@ http-body-util = "0.1"
 hyper = "1"
 bytes = "1"
 futures = "0.3"
+# Phase 2 waterfall: a custom instrumented upstream connector. Versions/features
+# mirror hudsucker 0.23's own `with_rustls_client` so the client is byte-identical
+# apart from the timing wrapper.
+hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "tls12", "webpki-tokio"] }
+tower-service = "0.3"

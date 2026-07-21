@@ -343,8 +343,8 @@
   #dMeta b{color:var(--fg)}
   #dMeta .wf{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--panel2);width:100%}
   #dMeta .wf .seg{height:100%}
-  #dMeta .wf .wait{background:#d9b02b} #dMeta .wf .dl{background:#3fb950}
-  #dMeta .lg-wait{color:#d9b02b} #dMeta .lg-dl{color:#3fb950}
+  #dMeta .wf .conn{background:#58a6ff} #dMeta .wf .wait{background:#d9b02b} #dMeta .wf .dl{background:#3fb950}
+  #dMeta .lg-conn{color:#58a6ff} #dMeta .lg-wait{color:#d9b02b} #dMeta .lg-dl{color:#3fb950}
 </style>
 </head>
 <body>
@@ -860,11 +860,18 @@ Import-Certificate -FilePath bogbogprox-ca.pem `
     let html = `<div class="row">🕑 <b>${fullDateTime(s.ts)}</b><span>flow #${s.id}</span></div>`;
     if(s.wait_ms!=null && s.download_ms!=null){
       const tot = s.duration_ms || (s.wait_ms + s.download_ms) || 1;
-      const wpct = Math.min(98, Math.max(2, Math.round(100*s.wait_ms/tot)));
-      html += `<div class="wf"><div class="seg wait" style="width:${wpct}%"></div><div class="seg dl" style="width:${100-wpct}%"></div></div>`+
+      const conn = s.connect_ms || 0;
+      const srvWait = Math.max(0, s.wait_ms - conn);   // wait includes connect; split it out
+      const pct = v => Math.max(v>0?2:0, Math.round(100*v/tot));
+      const cpct = pct(conn), wpct = pct(srvWait), dpct = pct(s.download_ms);
+      html += `<div class="wf">`+
+          (conn>0?`<div class="seg conn" style="width:${cpct}%"></div>`:``)+
+          `<div class="seg wait" style="width:${wpct}%"></div>`+
+          `<div class="seg dl" style="width:${dpct}%"></div></div>`+
         `<div class="row"><span>⏱ <b>${s.duration_ms??'–'} ms</b> total</span>`+
-        `<span class="lg-wait">■ wait ${s.wait_ms} ms</span>`+
-        `<span class="lg-dl">■ download ${s.download_ms} ms</span></div>`;
+          (conn>0?`<span class="lg-conn">■ connect ${conn} ms</span>`:`<span style="color:var(--dim)">■ connect — (reused)</span>`)+
+          `<span class="lg-wait">■ wait ${srvWait} ms</span>`+
+          `<span class="lg-dl">■ download ${s.download_ms} ms</span></div>`;
     } else if(s.duration_ms!=null){
       html += `<div class="row"><span>⏱ <b>${s.duration_ms} ms</b> total</span><span style="color:var(--dim)">(waterfall shows for flows captured live)</span></div>`;
     }
