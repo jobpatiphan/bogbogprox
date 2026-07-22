@@ -4,10 +4,12 @@
 //! request/response pair, writes it through the [`FlowStore`] port, and emits
 //! [`FlowEvent`]s for realtime frontends.
 //!
-//! Request→response correlation is per-connection FIFO. This is correct because
-//! we build hudsucker without its `http2` feature, so both the client-facing and
-//! upstream connections are HTTP/1.1 — requests are serialized per connection and
-//! never multiplexed.
+//! HTTP/1.1 **and HTTP/2** are supported (the `http2` feature negotiates via ALPN
+//! on both the client-facing and upstream sides). Request→response correlation is
+//! safe under h2 multiplexing because hudsucker clones this handler *per request*
+//! (`self.clone().proxy(req)` per stream) and calls `handle_request`/
+//! `handle_response` on that same clone — so each stream keeps its own `pending`
+//! entry and concurrent streams never cross-correlate.
 
 pub mod ca;
 
@@ -724,7 +726,7 @@ where
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(rustls_config.clone())
         .https_or_http()
-        .enable_http1()
+        .enable_all_versions() // negotiate h2 or h1 upstream via ALPN
         .build();
 
     let timed = TimedConnector {

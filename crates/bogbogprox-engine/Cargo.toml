@@ -11,7 +11,9 @@ bogbogprox-plugin = { path = "../bogbogprox-plugin" }
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-hudsucker = "0.23"
+# http2 feature: serve + speak HTTP/2 (browser↔proxy and proxy↔upstream). h1 stays
+# supported (the auto server/connector negotiate per-connection via ALPN).
+hudsucker = { version = "0.23", features = ["http2"] }
 rcgen = { version = "0.13", features = ["pem"] }
 http-body-util = "0.1"
 hyper = "1"
@@ -19,7 +21,7 @@ bytes = "1"
 futures = "0.3"
 # Phase 2 waterfall: a custom instrumented upstream connector. Versions/features
 # mirror hudsucker 0.23's own `with_rustls_client` so the client is byte-identical
-# apart from the timing wrapper.
-hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "tls12", "webpki-tokio"] }
+# apart from the timing wrapper. http2 lets the upstream negotiate h2 via ALPN.
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "tls12", "webpki-tokio"] }
 tower-service = "0.3"
